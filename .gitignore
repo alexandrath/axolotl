@@ -1,0 +1,10 @@
+*.dat
+*.npy
+*.h5
+*.mat
+*.log
+__pycache__/
+*.so
+.DS_Store
+.ipynb_checkpoints/
+
