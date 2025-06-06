@@ -4,11 +4,14 @@ import torch
 import multiprocessing as mp
 from scipy.io import loadmat
 from run_scoring_block import run_scoring_block
+from multiprocessing import shared_memory
+
 
 def run_multi_gpu_ei_scan(ei_mat_path, dat_path, total_samples,
                           save_prefix='/tmp/ei_scan', dtype='int16',
                           block_size=None, baseline_start_sample=0,
-                          channel_major=False):
+                          channel_major=False,
+                          raw_data_override=None):
     """
     Run EI template matching on a .dat file using multiple GPUs.
 
@@ -44,6 +47,24 @@ def run_multi_gpu_ei_scan(ei_mat_path, dat_path, total_samples,
     ei_masks = mask[selected, :]
     ei_norms = np.linalg.norm(ei_template_sel * ei_masks, axis=1)
 
+
+    shm = None
+    shm_name = None
+    raw_shape = None
+    raw_dtype = None
+
+    if raw_data_override is not None:
+        raw_data_override = np.ascontiguousarray(raw_data_override)
+        raw_shape = raw_data_override.shape
+        raw_dtype = raw_data_override.dtype
+        nbytes = raw_data_override.nbytes
+        shm = shared_memory.SharedMemory(create=True, size=nbytes)
+        shm_buf = np.ndarray(raw_shape, dtype=raw_dtype, buffer=shm.buf)
+        shm_buf[:] = raw_data_override[:]
+        shm_name = shm.name
+
+
+
     mp.set_start_method('spawn', force=True)
 
     # --- Run on multiple GPUs ---
@@ -55,6 +76,7 @@ def run_multi_gpu_ei_scan(ei_mat_path, dat_path, total_samples,
     samples_per_gpu = n_timepoints // n_gpus
     remainder = n_timepoints % n_gpus
     processes = []
+
     for gpu_id in range(n_gpus):
         score_start = gpu_id * samples_per_gpu + min(gpu_id, remainder)
         score_len = samples_per_gpu + (1 if gpu_id < remainder else 0)
@@ -67,8 +89,16 @@ def run_multi_gpu_ei_scan(ei_mat_path, dat_path, total_samples,
         p = mp.Process(target=run_scoring_block, args=(
             gpu_id, sample_start, GPU_samples, save_prefix, dat_path,
             ei_template_sel, ei_masks, ei_norms, selected,
-            dtype, block_size, baseline_start_sample,channel_major
+            dtype, block_size, baseline_start_sample, channel_major,
+            shm_name, raw_shape, str(raw_dtype)  # ← new args
         ))
+
+
+        # p = mp.Process(target=run_scoring_block, args=(
+        #     gpu_id, sample_start, GPU_samples, save_prefix, dat_path,
+        #     ei_template_sel, ei_masks, ei_norms, selected,
+        #     dtype, block_size, baseline_start_sample,channel_major
+        # ))
         p.start()
         processes.append(p)
 
@@ -92,6 +122,10 @@ def run_multi_gpu_ei_scan(ei_mat_path, dat_path, total_samples,
 
     for p in processes:
         p.join()
+
+    if shm is not None:
+        shm.close()
+        shm.unlink()
 
     # --- Merge outputs ---
     n_timepoints = total_samples - snippet_len + 1

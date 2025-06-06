@@ -20,7 +20,6 @@ from typing import Union, Tuple
 from matplotlib import gridspec
 from matplotlib.table import Table
 from plot_ei_waveforms import plot_ei_waveforms
-
 from scipy.io import loadmat
 from scipy.ndimage import gaussian_filter1d
 from compute_sta_from_spikes import compute_sta_chunked
@@ -29,14 +28,36 @@ from matplotlib import rcParams
 import itertools
 
 
+def compute_baselines_int16(raw_data, segment_len=100_000):
+    """
+    Compute mean baseline per channel over non-overlapping segments.
+    No artifact suppression. Operates directly on int16 data.
+    
+    Input:
+    - raw_data: [T, C], int16
+    - segment_len: samples per segment (default 100,000)
+
+    Output:
+    - baselines: [C, n_segments] float32
+    """
+    total_samples, n_channels = raw_data.shape
+    n_segments = (total_samples + segment_len - 1) // segment_len
+
+    baselines = np.zeros((n_channels, n_segments), dtype=np.float32)
+
+    for seg_idx in range(n_segments):
+        start = seg_idx * segment_len
+        end = min(start + segment_len, total_samples)
+        segment = raw_data[start:end, :]  # [segment_len, C]
+        baselines[:, seg_idx] = segment.mean(axis=0)
+
+    return baselines
 
 
 
-def find_dominant_channel(
-    dat_path: str,
-    n_channels: int,
-    dtype: np.dtype = np.int16,
-    segment_len: int = 100000,
+def find_dominant_channel_ram(
+    raw_data: np.ndarray,
+    segment_len: int = 100_000,
     n_segments: int = 10,
     peak_window: int = 30,
     top_k_neg: int = 20,
@@ -44,119 +65,104 @@ def find_dominant_channel(
     seed: int = 42
 ) -> int:
     """
-    Identify the channel with the largest spike-like events from a channel-major .dat file.
+    Identify the channel with the largest spike-like events from RAM-resident time-major data.
 
     Parameters:
-        dat_path: Path to channel-major binary file
-        n_channels: Total number of channels (should match file format)
-        dtype: Data type (e.g., np.int16)
-        segment_len: Samples per time segment (along time axis)
-        n_segments: Total number of segments to scan
-        peak_window: Half-width for local peak-to-peak measurement
-        top_k_neg: Number of most negative peaks to use per channel
-        top_k_events: Number of top amplitudes to average per channel
-        seed: Random seed
+        raw_data: ndarray of shape [T, C] (time-major)
+        segment_len: number of samples per segment
+        n_segments: how many segments to check (1 fixed start + N-1 random)
+        peak_window: half-width for spike amplitude window
+        top_k_neg: number of negative peaks to keep per channel per segment
+        top_k_events: number of top amplitudes to average per channel
+        seed: RNG seed for reproducibility
 
     Returns:
         Index of the dominant channel
     """
-    import numpy as np
-    from scipy.signal import find_peaks
-
-    bytes_per_sample = np.dtype(dtype).itemsize
-    file_size = os.path.getsize(dat_path)
-    total_samples = file_size // (n_channels * bytes_per_sample)
-
-
-    # Memory-map entire channel-major file
-    #data = np.memmap(dat_path, dtype=dtype, mode='r', shape=(n_channels, -1))
-    #total_samples = data.shape[1]
-
-    data = np.memmap(dat_path, dtype=dtype, mode='r', shape=(n_channels, total_samples))
-
-
+    total_samples, n_channels = raw_data.shape
     rng = np.random.default_rng(seed)
-    first_segment_start = rng.integers(0, min(100000, total_samples - segment_len))
+
+    # Always include one deterministic first segment
+    first_segment_start = rng.integers(0, min(100_000, total_samples - segment_len))
     other_starts = rng.integers(0, total_samples - segment_len, size=n_segments - 1)
     start_indices = np.concatenate([[first_segment_start], other_starts])
 
+    # Store candidate amplitudes per channel
     channel_amplitudes = [[] for _ in range(n_channels)]
 
     for start in start_indices:
-        segment = data[:, start:start + segment_len].astype(np.float32)
-
+        segment = raw_data[start:start + segment_len, :]  # [seg_len, C]
+        
         for ch in range(n_channels):
-            trace = segment[ch]
-            trace -= trace.mean()
+            trace = segment[:, ch]  # int16
+            trace_centered = trace - np.mean(trace)  # still int16 in effect
 
-            neg_peaks, _ = find_peaks(-trace, distance=20)
+            neg_peaks, _ = find_peaks(-trace_centered, distance=20)
             if len(neg_peaks) == 0:
                 continue
 
-            sorted_idx = np.argsort(trace[neg_peaks])
-            neg_peaks = neg_peaks[sorted_idx[:top_k_neg]]
+            sorted_idx = np.argsort(trace_centered[neg_peaks])
+            selected_peaks = neg_peaks[sorted_idx[:top_k_neg]]
 
-            for peak_idx in neg_peaks:
+            for peak_idx in selected_peaks:
                 win_start = max(peak_idx - peak_window, 0)
                 win_end = min(peak_idx + peak_window + 1, segment_len)
-                local_max = np.max(trace[win_start:win_end])
-                amplitude = local_max - trace[peak_idx]
+
+                local_window = trace_centered[win_start:win_end].astype(np.float32)
+                local_max = np.max(local_window)
+                valley = trace_centered[peak_idx].astype(np.float32)
+                amplitude = local_max - valley
+
                 channel_amplitudes[ch].append(amplitude)
 
-    mean_amplitudes = np.zeros(n_channels)
+
+    # Score: mean of top_k_events per channel
+    mean_amplitudes = np.zeros(n_channels, dtype=np.float32)
     for ch in range(n_channels):
-        amps = np.array(channel_amplitudes[ch])
+        amps = np.array(channel_amplitudes[ch], dtype=np.float32)
         if len(amps) > 0:
             mean_amplitudes[ch] = np.mean(np.sort(amps)[-top_k_events:])
 
-    return int(np.argmax(mean_amplitudes))
+    # --- Return top N channels in descending order of score ---
+    top_n = 10  # hardcoded for now
+    sorted_indices = np.argsort(mean_amplitudes)[::-1]  # descending order
+    top_channels = sorted_indices[:top_n].tolist()
+
+    return top_channels
+
+    # ref_channel = int(np.argmax(mean_amplitudes))
+    # return ref_channel
 
 
 
-def estimate_spike_threshold(
-    dat_path: str,
+from scipy.signal import find_peaks
+from scipy.ndimage import uniform_filter1d
+import numpy as np
+
+def estimate_spike_threshold_ram(
+    raw_data: np.ndarray,
     ref_channel: int,
-    dtype: np.dtype = np.int16,
     window: int = 30,
-    n_channels: int = 512,
     total_samples_to_read: int = 10_000_000,
-    block_size: int = 100_000,
     refractory: int = 30,
     top_n: int = 100
 ) -> tuple[float, np.ndarray]:
     """
-    Estimate spike threshold on the dominant channel using negative peaks with post-peak rebound.
+    Estimate spike threshold from RAM-resident time-major raw_data.
 
     Parameters:
-        dat_path: Path to channel-major binary .dat file
-        ref_channel: Dominant channel index from step 1
-        dtype: Data type of the recording (e.g., np.int16)
-        window: ±window around negative peak to detect post-peak amplitude
-        n_channels: Total number of electrodes
-        total_samples_to_read: How many samples to scan for spike-like events
-        block_size: Chunk size for I/O
-        refractory: Minimum separation (in samples) between peaks
-        top_n: How many events to use to estimate threshold
+        raw_data: ndarray of shape [T, C] (int16)
+        ref_channel: index of the dominant channel
+        window: samples around negative peak for local max
+        total_samples_to_read: number of samples to analyze
+        refractory: minimum spacing between detected spikes
+        top_n: number of strongest events used to estimate threshold
 
     Returns:
-        threshold: Estimated threshold (0.5× mean of top negative peaks)
-        spike_times: Indices of all suprathreshold events detected on the ref channel
+        threshold: half the mean of top-N negative peaks
+        spike_times: indices of suprathreshold events
     """
-    trace = np.zeros(total_samples_to_read, dtype=np.float32)
-    bytes_per_sample = np.dtype(dtype).itemsize
-    samples_read = 0
-
-    with open(dat_path, 'rb') as f:
-        while samples_read < total_samples_to_read:
-            samples_to_load = min(block_size, total_samples_to_read - samples_read)
-            offset = (ref_channel * total_samples_to_read + samples_read) * bytes_per_sample
-            f.seek(offset)
-            raw = np.fromfile(f, dtype=dtype, count=samples_to_load)
-            if len(raw) != samples_to_load:
-                break
-            trace[samples_read:samples_read+samples_to_load] = raw
-            samples_read += samples_to_load
-
+    trace = raw_data[:total_samples_to_read, ref_channel].astype(np.float32)
     trace -= np.mean(trace)
 
     neg_peaks, _ = find_peaks(-trace, distance=2 * refractory)
@@ -189,6 +195,321 @@ def estimate_spike_threshold(
     spike_times = np.array(selected_peaks)
 
     return threshold, spike_times
+
+
+def extract_snippets_ram(
+    raw_data: np.ndarray,
+    spike_times: np.ndarray,
+    window: tuple[int, int],
+    selected_channels: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Extract snippets from time-major raw_data around spike_times.
+
+    Parameters:
+        raw_data: ndarray of shape [T, C] (int16)
+        spike_times: array of spike indices (int)
+        window: tuple (pre, post) in samples
+        selected_channels: array of channel indices to include
+
+    Returns:
+        snippets: [n_channels, n_samples, n_spikes] float32
+        valid_spike_times: spike_times for which the snippet was valid
+    """
+    pre, post = window
+    total_samples, _ = raw_data.shape
+
+    valid_times = []
+    snippets = []
+
+    for t in spike_times:
+        if t + pre < 0 or t + post >= total_samples:
+            continue
+        snippet = raw_data[t + pre : t + post + 1, selected_channels]  # [T, C]
+        snippets.append(snippet.T.astype(np.float32))  # [C, T]
+        valid_times.append(t)
+
+    snippets = np.stack(snippets, axis=2)  # [C, T, N]
+    valid_times = np.array(valid_times)
+
+    return snippets, valid_times
+
+
+
+def sub_sample_align_ei(ei_template, ei_candidate, ref_channel, upsample=10, max_shift=2.0):
+    """
+    Align ei_candidate to ei_template using sub-sample alignment on the reference channel.
+
+    Parameters:
+        ei_template : np.ndarray [C x T]
+        ei_candidate : np.ndarray [C x T]
+        ref_channel : int — channel to use for alignment
+        upsample : int — interpolation factor (e.g., 10 for 0.1 sample resolution)
+        max_shift : float — maximum shift allowed (in samples)
+
+    Returns:
+        aligned_candidate : np.ndarray [C x T] — shifted ei_candidate
+    """
+    C, T = ei_template.shape
+    assert ei_candidate.shape == (C, T), "Shape mismatch"
+
+    t = np.arange(T)
+    t_interp = np.linspace(0, T - 1, T * upsample)
+
+    # Interpolate both waveforms
+    interp_template = interp1d(t, ei_template[ref_channel], kind='cubic', bounds_error=False, fill_value=0.0)
+    interp_candidate = interp1d(t, ei_candidate[ref_channel], kind='cubic', bounds_error=False, fill_value=0.0)
+
+    template_highres = interp_template(t_interp)
+    candidate_highres = interp_candidate(t_interp)
+
+    # Cross-correlation to find best fractional lag
+    full_corr = correlate(candidate_highres, template_highres, mode='full')
+    lags = np.arange(-len(candidate_highres) + 1, len(template_highres))
+    center = len(full_corr) // 2
+    lag_window = int(max_shift * upsample)
+    search_range = slice(center - lag_window, center + lag_window + 1)
+
+    best_lag_index = np.argmax(full_corr[search_range])
+    fractional_shift = lags[search_range][best_lag_index] / upsample
+
+    # Apply same shift to all channels
+    aligned_candidate = np.zeros_like(ei_candidate)
+    for ch in range(C):
+        interp_func = interp1d(t, ei_candidate[ch], kind='cubic', bounds_error=False, fill_value=0.0)
+        shifted_time = t - fractional_shift
+        aligned_candidate[ch] = interp_func(shifted_time)
+
+    return aligned_candidate, fractional_shift
+
+
+def compare_ei_subtraction(ei_a, ei_b, max_lag=3, p2p_thresh=30.0):
+    """
+    Compare two EIs using subtraction and cosine similarity, with variance-based residual thresholding.
+
+    Parameters:
+        ei_a : np.ndarray
+            Reference EI, shape (n_channels, n_samples)
+        ei_b : np.ndarray
+            Test EI, shape (n_channels, n_samples)
+        max_lag : int
+            Max lag (in samples) for alignment
+        p2p_thresh : float
+            Minimum peak-to-peak threshold to consider a channel for comparison
+        scale_factor : float
+            Multiplier for variance-based residual threshold
+
+    Returns:
+        result : dict with keys:
+            - mean_residual
+            - max_abs_residual
+            - good_channels
+            - per_channel_residuals
+            - per_channel_cosine_sim
+            - p2p_a
+    """
+    C, T = ei_a.shape
+    assert ei_b.shape == (C, T), "EIs must have same shape"
+
+    # Identify dominant channel from A
+    ref_chan = np.argmax(np.max(np.abs(ei_a), axis=1))
+
+    # Align B to A using sub-sample alignment
+    aligned_b, fractional_shift = sub_sample_align_ei(ei_template=ei_a, ei_candidate=ei_b, ref_channel=ref_chan, upsample=10, max_shift=max_lag)
+
+    # Select meaningful channels based on P2P of A
+    p2p_a = ei_a.max(axis=1) - ei_a.min(axis=1)
+    good_channels = np.where(p2p_a > p2p_thresh)[0]
+
+    per_channel_residuals = []
+    per_channel_cosine_sim = []
+    all_residuals = []
+
+    for ch in good_channels:
+        a = ei_a[ch]
+        b = aligned_b[ch]
+
+        mask = np.abs(a) > 0.1 * np.max(np.abs(a))
+        if not np.any(mask):
+            continue
+
+        a_masked = a[mask]
+        b_masked = b[mask]
+
+        residual = b_masked - a_masked
+        per_channel_residuals.append(np.mean(residual))
+        all_residuals.extend(residual)
+
+        dot = np.dot(a_masked, b_masked)
+        norm_product = np.linalg.norm(a_masked) * np.linalg.norm(b_masked) + 1e-8
+        cosine_sim = dot / norm_product
+        per_channel_cosine_sim.append(cosine_sim)
+
+    all_residuals = np.array(all_residuals)
+    mean_residual = np.mean(all_residuals)
+    max_abs_residual = np.max(np.abs(all_residuals))
+
+    return {
+        'mean_residual': mean_residual,
+        'max_abs_residual': max_abs_residual,
+        'good_channels': good_channels,
+        'per_channel_residuals': per_channel_residuals,
+        'per_channel_cosine_sim': per_channel_cosine_sim,
+        'fractional_shift': fractional_shift,
+        'p2p_a': p2p_a
+    }
+
+import numpy as np
+
+def merge_similar_clusters(snips, labels, max_lag=3, p2p_thresh=30.0, amp_thresh=-20, cos_thresh=0.8):
+    cluster_ids = sorted(np.unique(labels))
+    cluster_spike_indices = {k: np.where(labels == k)[0] for k in cluster_ids}
+    cluster_eis = []
+    cluster_vars = []
+    for k in cluster_ids:
+        inds = cluster_spike_indices[k]
+        ei_k = np.mean(snips[:, :, inds], axis=2)
+        #ei_k -= ei_k[:, :5].mean(axis=1, keepdims=True)
+        cluster_eis.append(ei_k)
+
+        # --- Variance at peak +/-1 sample ---
+        peak_idxs = np.argmin(ei_k, axis=1)  # (n_channels,)
+        n_channels, n_samples = ei_k.shape
+        channel_var = np.zeros(n_channels)
+        for ch in range(n_channels):
+            idx = peak_idxs[ch]
+            if 1 <= idx < n_samples - 1:
+                local_waveform = snips[ch, idx-1:idx+2, inds]  # shape (3, n_spikes)
+                channel_var[ch] = np.var(local_waveform)
+            else:
+                channel_var[ch] = 0.0
+
+        cluster_vars.append(channel_var)
+
+
+    n_clusters = len(cluster_ids)
+    sim = np.eye(n_clusters)
+    n_bad_channels = np.zeros((n_clusters, n_clusters), dtype=int)
+
+    # --- Compute similarity matrix and bad channels ---
+    for i in range(n_clusters):
+        for j in range(n_clusters):
+            if i != j:
+                ei_a = cluster_eis[i]
+                ei_b = cluster_eis[j]
+                var_a = cluster_vars[i]
+                res_ab = compare_ei_subtraction(ei_a, ei_b, max_lag=max_lag, p2p_thresh=p2p_thresh)
+                res = np.array(res_ab['per_channel_residuals'])
+                p2p_a = res_ab['p2p_a']
+                good_channels = res_ab['good_channels']
+                cos_sim = np.array(res_ab['per_channel_cosine_sim'])
+                ch_weights = np.array(p2p_a[good_channels])
+
+                snr_score = 1 / (1 + var_a[good_channels] / (p2p_a[good_channels] ** 2 + 1e-3))
+                # snr = p2p_a[good_channels] ** 2 / (var_a[good_channels] + 1e-3)
+                snr_mask = snr_score > 0.5  # or whatever cutoff you choose
+
+                res_subset = res[snr_mask]
+
+                cos_sim_masked = cos_sim[snr_mask]
+                ch_weights_masked = ch_weights[snr_mask]
+
+                if len(cos_sim_masked) > 0:
+                    weighted_cos_sim = np.average(cos_sim_masked, weights=ch_weights_masked)
+                else:
+                    weighted_cos_sim = 0.0  # Or np.nan, or skip this pair entirely
+                #adaptive_thresh = amp_thresh * (var_a[good_channels]/ (p2p_a[good_channels] + 1e-3))
+                # res_subset = res[good_channels]
+                #res_subset = res
+                neg_inds = np.where(res_subset < amp_thresh)[0]
+                # neg_inds = np.where(res_subset < adaptive_thresh)[0]
+
+                # neg_inds = np.where(res < amp_thresh)[0]
+                sim[i, j] = weighted_cos_sim
+                n_bad_channels[i, j] = len(neg_inds)
+
+                # noise_score = var_a[good_channels] / (p2p_a[good_channels] + 1e-3)
+
+                # fig, axs = plt.subplots(5, 1, figsize=(16, 8), sharex=True)
+
+                # axs[0].plot(good_channels, snr_score, marker='o')
+                # axs[0].set_ylabel("Normalized Variance (SNR)")
+                # axs[0].set_title("Channel-wise Variance / P2P")
+
+                # axs[1].plot(good_channels, res, marker='o')
+                # axs[1].set_ylabel("Residuals (B - A)")
+                # axs[1].set_title("Channel-wise Mean Residuals")
+
+                # axs[2].plot(good_channels, res_ab['per_channel_cosine_sim'] * p2p_a[good_channels], marker='o')
+                # axs[2].set_ylabel("Cosine Similarity")
+                # axs[2].set_title(f"Weighted Cosine Similarity, mean = {weighted_cos_sim}")
+                # axs[2].set_xlabel("Channel ID")
+
+                # axs[3].plot(good_channels, res_ab['per_channel_cosine_sim'], marker='o')
+                # axs[3].set_ylabel("Cosine Similarity")
+                # axs[3].set_title(f"Unweighted Cosine Similarity, mean {np.mean(res_ab['per_channel_cosine_sim'])}")
+                # axs[3].set_xlabel("Channel ID")
+
+                # axs[4].plot(good_channels, adaptive_thresh, marker='o')
+                # axs[4].set_ylabel("adaptive_thresh")
+                # axs[4].set_title("adaptive_thresh")
+                # axs[4].set_xlabel("Channel ID")
+
+                # for ax in axs:
+                #     ax.grid(True)
+                #     ax.set_xticks(good_channels)
+                #     ax.set_xticklabels(good_channels, rotation=45)
+
+                # plt.tight_layout()
+                # plt.show()
+
+    # --- Merge clusters using precomputed similarities ---
+    cluster_sizes = {i: len(cluster_spike_indices[i]) for i in cluster_ids}
+    sorted_cluster_ids = sorted(cluster_ids, key=lambda i: cluster_sizes[i], reverse=True)
+
+    assigned = set()
+    merged_clusters = []
+
+    id_to_index = {cid: idx for idx, cid in enumerate(cluster_ids)}
+
+    for i in sorted_cluster_ids:
+        if i in assigned:
+            continue
+
+        i_idx = id_to_index[i]
+        base_inds = cluster_spike_indices[i]
+        group = list(base_inds)
+        assigned.add(i)
+
+        for j in sorted_cluster_ids:
+            if j in assigned or j == i:
+                continue
+
+            j_idx = id_to_index[j]
+            sim_ij = sim[i_idx, j_idx]
+            n_bad = n_bad_channels[i_idx, j_idx]
+
+            if sim_ij >= 0.95 and n_bad <= 4:
+                accept = True
+            elif sim_ij >= 0.90 and n_bad <= 2:
+                accept = True
+            elif sim_ij >= cos_thresh and n_bad == 0:
+                accept = True
+            else:
+                accept = False
+
+            if accept:
+                group.extend(cluster_spike_indices[j])
+                assigned.add(j)
+            # if n_bad == 0 and sim_ij >= cos_thresh:
+            #     group.extend(cluster_spike_indices[j])
+            #     assigned.add(j)
+
+        merged_clusters.append(np.sort(np.array(group)))
+
+    return merged_clusters, sim, n_bad_channels
+
+
 
 
 
@@ -245,57 +566,59 @@ def cluster_spike_waveforms(
         plt.show()
 
 
-    cluster_spike_indices = {k: np.where(labels == k)[0] for k in np.unique(labels)}
+    merged_clusters, sim, n_bad_channels = merge_similar_clusters(snips, labels, max_lag=3, p2p_thresh=30.0, amp_thresh=-20, cos_thresh=0.8)
 
-    cluster_eis = []
-    cluster_ids = sorted(cluster_spike_indices.keys())
-    for k in cluster_ids:
-        inds = cluster_spike_indices[k]
-        ei_k = np.mean(snips[:, :, inds], axis=2)
-        ei_k -= ei_k[:, :5].mean(axis=1, keepdims=True)
-        cluster_eis.append(ei_k)
+    # cluster_spike_indices = {k: np.where(labels == k)[0] for k in np.unique(labels)}
 
-    sim = compare_eis(cluster_eis)
-    if plot_diagnostic == True:
-        print("Similarity before merge:\n")
-        print(sim)
+    # cluster_eis = []
+    # cluster_ids = sorted(cluster_spike_indices.keys())
+    # for k in cluster_ids:
+    #     inds = cluster_spike_indices[k]
+    #     ei_k = np.mean(snips[:, :, inds], axis=2)
+    #     ei_k -= ei_k[:, :5].mean(axis=1, keepdims=True)
+    #     cluster_eis.append(ei_k)
 
-    if not merge:
-        output = []
-        for k in cluster_ids:
-            inds = cluster_spike_indices[k]
-            ei_cluster = np.mean(snips[:, :, inds], axis=2)
-            ei_cluster -= ei_cluster[:, :5].mean(axis=1, keepdims=True)
-            output.append({
-                'inds': inds,
-                'ei': ei_cluster,
-                'channels': selected_channels
-            })
-        if return_debug:
-            return output, pcs, labels, sim
-        else:
-            return output
+    # sim = compare_eis(cluster_eis)
+    # if plot_diagnostic == True:
+    #     print("Similarity before merge:\n")
+    #     print(sim)
+
+    # if not merge:
+    #     output = []
+    #     for k in cluster_ids:
+    #         inds = cluster_spike_indices[k]
+    #         ei_cluster = np.mean(snips[:, :, inds], axis=2)
+    #         ei_cluster -= ei_cluster[:, :5].mean(axis=1, keepdims=True)
+    #         output.append({
+    #             'inds': inds,
+    #             'ei': ei_cluster,
+    #             'channels': selected_channels
+    #         })
+    #     if return_debug:
+    #         return output, pcs, labels, sim
+    #     else:
+    #         return output
 
 
-    G = nx.Graph()
-    G.add_nodes_from(range(len(cluster_ids)))
-    for i in range(len(cluster_ids)):
-        for j in range(i + 1, len(cluster_ids)):
-            if sim[i, j] >= sim_threshold:
-                G.add_edge(i, j)
+    # G = nx.Graph()
+    # G.add_nodes_from(range(len(cluster_ids)))
+    # for i in range(len(cluster_ids)):
+    #     for j in range(i + 1, len(cluster_ids)):
+    #         if sim[i, j] >= sim_threshold:
+    #             G.add_edge(i, j)
 
-    merged_groups = list(nx.connected_components(G))
-    merged_clusters = []
+    # merged_groups = list(nx.connected_components(G))
+    # merged_clusters = []
 
-    for group in merged_groups:
-        group = sorted(list(group))
-        all_inds = np.concatenate([cluster_spike_indices[cluster_ids[i]] for i in group])
-        merged_clusters.append(np.sort(all_inds))
+    # for group in merged_groups:
+    #     group = sorted(list(group))
+    #     all_inds = np.concatenate([cluster_spike_indices[cluster_ids[i]] for i in group])
+    #     merged_clusters.append(np.sort(all_inds))
 
     output = []
     for inds in merged_clusters:
         ei_cluster = np.mean(snips[:, :, inds], axis=2)
-        ei_cluster -= ei_cluster[:, :5].mean(axis=1, keepdims=True)
+        # ei_cluster -= ei_cluster[:, :5].mean(axis=1, keepdims=True)
         output.append({
             'inds': inds,
             'ei': ei_cluster,
@@ -303,7 +626,30 @@ def cluster_spike_waveforms(
         })
 
     if return_debug:
-        return output, pcs, labels, sim, cluster_eis
+
+        cluster_spike_indices = {k: np.where(labels == k)[0] for k in np.unique(labels)}
+        cluster_eis = []
+        cluster_ids = sorted(cluster_spike_indices.keys())
+        for k in cluster_ids:
+            inds = cluster_spike_indices[k]
+            ei_k = np.mean(snips[:, :, inds], axis=2)
+            # ei_k -= ei_k[:, :5].mean(axis=1, keepdims=True)
+            cluster_eis.append(ei_k)
+
+        cluster_to_merged_group = {}
+
+        for orig_id, orig_inds in cluster_spike_indices.items():
+            orig_set = set(orig_inds)
+
+            for group_idx, merged_inds in enumerate(merged_clusters):
+                merged_set = set(merged_inds)
+
+                if orig_set.issubset(merged_set):
+                    cluster_to_merged_group[orig_id] = group_idx
+                    break
+
+
+        return output, pcs, labels, sim, n_bad_channels, cluster_eis, cluster_to_merged_group
     else:
         return output
 
@@ -336,51 +682,62 @@ def select_cluster_with_largest_waveform(
     return best['ei'], best['inds'], best['channels'], best_idx
 
 
-def ei_pursuit(
-    dat_path: str,
+import numpy as np
+from scipy.signal import argrelextrema
+from scipy.stats import norm
+import scipy.io as sio
+from typing import Union, Tuple
+
+def ei_pursuit_ram(
+    raw_data: np.ndarray,
     spikes: np.ndarray,
     ei_template: np.ndarray,
-    dtype: str = 'int16',
-    total_samples: int = 10_000_000,
-    save_prefix: str = '/Volumes/Lab/Users/alexth/axolotl/ei_scan_unit0',
-    block_size: int = None,
-    baseline_start_sample: int = 0,
+    save_prefix: str = '/tmp/ei_scan_unit0',
     alignment_offset: int = 20,
     fit_percentile: float = 40,
     sigma_thresh: float = 5.0,
-    channel_major: bool = True,
-    return_debug: bool = False   # ← new
+    return_debug: bool = False
 ) -> Union[np.ndarray, Tuple]:
     """
-    Run EI template matching using multi-GPU scan, apply thresholding, and return spike times.
+    RAM-resident version of EI pursuit using pre-loaded time-major data and EI template.
 
     Parameters:
-        dat_path: Path to raw .dat file
+        raw_data: [T, C] int16 full data in RAM
         spikes: Initial spike times (absolute sample indices)
-        ei_template: [channels x timepoints] EI to use as matching template
-        dtype: Data type of the file (e.g., 'int16')
-        total_samples: Length of dataset to scan
-        save_prefix: Where to save temp .npy files
+        ei_template: [channels x timepoints] template
+        save_prefix: Where to save temp .mat file for GPU
+        alignment_offset: Used to re-align accepted spike times
+        fit_percentile: Lower-tail fitting percentile
+        sigma_thresh: How strict to be when setting threshold
+        return_debug: Whether to return intermediate results
 
     Returns:
-        final_spike_times: np.ndarray of accepted spike times (in samples)
+        final_spike_times or full debug tuple
     """
+    from run_multi_gpu_ei_scan import run_multi_gpu_ei_scan  # uses raw file but loads template
+
+    # Save EI template to MAT file for GPU code
     ei_template_path = f"{save_prefix}_template.mat"
     sio.savemat(ei_template_path, {'ei_template': ei_template.astype(np.float32)})
 
+    # Run multi-GPU matching
     mean_score, max_score, valid_score, selected_channels, _ = run_multi_gpu_ei_scan(
         ei_mat_path=ei_template_path,
-        dat_path=dat_path,
-        total_samples=total_samples,
+        dat_path=None,  # Not used; raw_data is in RAM
+        total_samples=raw_data.shape[0],
         save_prefix=save_prefix,
-        dtype=dtype,
-        block_size=block_size,
-        baseline_start_sample=baseline_start_sample,
-        channel_major=channel_major
+        dtype='int16',  # Unused if you're bypassing dat_path
+        block_size=None,
+        baseline_start_sample=0,
+        channel_major=False,  # We are now time-major
+        raw_data_override=raw_data  # This requires modification inside run_multi_gpu_ei_scan
     )
 
+    # Adjust for alignment offset
     adjusted_selected_inds = spikes - alignment_offset
-    adjusted_selected_inds = adjusted_selected_inds[(adjusted_selected_inds >= 0) & (adjusted_selected_inds < len(mean_score))]
+    adjusted_selected_inds = adjusted_selected_inds[
+        (adjusted_selected_inds >= 0) & (adjusted_selected_inds < len(mean_score))
+    ]
 
     def fit_threshold(scores):
         cutoff = np.percentile(scores, fit_percentile)
@@ -394,66 +751,20 @@ def ei_pursuit(
     mean_threshold = fit_threshold(mean_scores)
     valid_threshold = fit_threshold(valid_scores)
 
-    # import matplotlib.pyplot as plt
-
-    # center = 2666246
-    # window_for_plot = 60
-    # x = np.arange(center - window_for_plot, center + window_for_plot + 1)
-    # y = mean_score[center - window_for_plot : center + window_for_plot + 1]
-
-    # plt.figure(figsize=(10, 3))
-    # plt.plot(x, y, marker='o')
-    # plt.axvline(center, color='red', linestyle='--', label='Spike')
-    # plt.title(f"Mean score around spike {center}")
-    # plt.xlabel("Sample")
-    # plt.ylabel("Score")
-    # plt.legend()
-    # plt.grid(True)
-    # plt.tight_layout()
-    # plt.show()
-
-
-    # import matplotlib.pyplot as plt
-
-    # # --- Histogram for mean scores ---
-    # plt.figure(figsize=(12, 5))
-
-    # plt.subplot(1, 2, 1)
-    # #plt.hist(mean_score, bins=200, alpha=0.4, label='All scores', color='gray', density=True)
-    # plt.hist(mean_scores[:1400], bins=50, alpha=0.6, label='True spikes', color='blue', density=True)
-    # plt.axvline(mean_threshold, color='red', linestyle='--', label='Mean threshold')
-    # plt.title("Mean Score Distribution")
-    # plt.xlabel("Score")
-    # plt.ylabel("Density")
-    # plt.legend()
-    # plt.grid(True)
-
-    # # --- Histogram for valid scores ---
-    # plt.subplot(1, 2, 2)
-    # #plt.hist(valid_score, bins=100, alpha=0.4, label='All valid counts', color='gray', density=True)
-    # plt.hist(valid_scores[:1400], bins=50, alpha=0.6, label='True spikes', color='blue', density=True)
-    # plt.axvline(valid_threshold, color='red', linestyle='--', label='Valid threshold')
-    # plt.title("Valid Channel Count Distribution")
-    # plt.xlabel("Valid Channels")
-    # plt.ylabel("Density")
-    # plt.legend()
-    # plt.grid(True)
-
-    # plt.tight_layout()
-    # plt.show()
-
     peaks = argrelextrema(mean_score, np.greater_equal, order=1)[0]
-    valid_inds = peaks[(mean_score[peaks] > mean_threshold) & (valid_score[peaks] > valid_threshold)]
+    valid_inds = peaks[
+        (mean_score[peaks] > mean_threshold) &
+        (valid_score[peaks] > valid_threshold)
+    ]
 
-
-    # accept at most 20% more than before...
+    # Cap accepted events to 1.2× original spike count
     if len(valid_inds) > len(spikes) * 1.2:
         limit = int(len(spikes) * 1.2)
         top_inds = np.argsort(mean_score[valid_inds])[::-1][:limit]
         valid_inds = valid_inds[top_inds]
 
-
     final_spike_times = valid_inds + alignment_offset
+
     if return_debug:
         return (
             final_spike_times,
@@ -468,7 +779,99 @@ def ei_pursuit(
         return final_spike_times
 
 
-def select_cluster_by_ei_similarity(
+def estimate_lags_by_xcorr_ram(snippets: np.ndarray, peak_channel_idx: int, window: tuple = (-5, 10), max_lag: int = 3) -> np.ndarray:
+    """
+    Estimate lag for each spike by cross-correlating with the mean waveform of the peak channel.
+
+    Parameters:
+        snippets: np.ndarray
+            Spike snippets of shape (N, C, T)
+        peak_channel_idx: int
+            Index of the peak (reference) channel
+        window: tuple
+            Relative window around the peak to consider for alignment
+        max_lag: int
+            Maximum lag to consider for alignment
+
+    Returns:
+        np.ndarray
+            Array of integer lags for each spike
+    """
+    N, C, T = snippets.shape
+    waveform = snippets[:, peak_channel_idx, :].mean(axis=0)
+    peak_idx = np.argmax(np.abs(waveform))
+
+
+    win_start = peak_idx + window[0]
+    win_end = peak_idx + window[1]
+
+    if win_start < 0 or win_end > T:
+
+        raise ValueError(f"Window around peak ({win_start}:{win_end}) is out of bounds for waveform length {T}")
+
+
+    ei_win = waveform[win_start:win_end]
+
+    lags = np.zeros(N, dtype=int)
+    for i in range(N):
+        snip = snippets[i, peak_channel_idx, win_start - max_lag : win_end + max_lag].copy()
+        if snip.shape[0] < ei_win.shape[0] + 2 * max_lag:
+            lags[i] = 0  # skip if snippet is too short
+            continue
+        corr = correlate(snip, ei_win, mode='valid')
+        lag = np.argmax(corr) - max_lag
+        lags[i] = lag
+
+    return lags
+
+
+
+
+def extract_snippets_single_channel(dat_path, spike_times, ref_channel,
+                                    window=(-20, 60), n_channels=512, dtype='int16'):
+    """
+    Extract raw data snippets from a time-major .dat file for a single channel.
+
+    Parameters:
+        dat_path: Path to the .dat file (time-major format)
+        spike_times: array of spike center times (in samples)
+        ref_channel: which channel to extract
+        window: (pre, post) time window around each spike
+        n_channels: number of electrodes in the recording
+        dtype: data type in file (e.g., 'int16')
+
+    Returns:
+        snips: [snippet_len x num_spikes] float32 array
+    """
+    pre, post = window
+    snip_len = post - pre + 1
+    spike_count = len(spike_times)
+
+    snips = np.zeros((snip_len, spike_count), dtype=np.float32)
+    bytes_per_sample = np.dtype(dtype).itemsize
+
+    with open(dat_path, 'rb') as f:
+        f.seek(0, 2)
+        total_samples = f.tell() // (n_channels * bytes_per_sample)
+
+        for i, center in enumerate(spike_times):
+            t_start = center + pre
+            t_end = center + post
+            if t_start < 0 or t_end >= total_samples:
+                continue  # skip invalid spikes
+
+            offset = (t_start * n_channels + ref_channel) * bytes_per_sample
+            f.seek(offset, 0)
+
+            # Read 1 channel every n_channels steps
+            raw = np.fromfile(f, dtype=dtype, count=snip_len * n_channels)[::n_channels]
+            snips[:, i] = raw.astype(np.float32)
+
+    return snips[np.newaxis, :, :]
+
+
+
+def select_cluster_by_ei_similarity_ram(
     clusters: list[dict],
     reference_ei: np.ndarray,
     similarity_threshold: float = 0.9
@@ -526,211 +929,8 @@ def select_cluster_by_ei_similarity(
     return final_ei, final_inds, final_channels, best_idx
 
 
-def subtract_unit_all_channels(
-    spike_times: np.ndarray,
-    ei: np.ndarray,
-    dat_path: str,
-    ei_positions: np.ndarray,
-    start_sample: int,
-    segment_length: int,
-    dtype: str,
-    n_channels: int,
-    window: tuple = (-20, 60),
-    fit_offsets: tuple = (-5, 10),
-    p2p_threshold: float = 15.0
-) -> dict:
-    """
-    Perform template subtraction for all EI-relevant channels of a unit over a given segment.
 
-    Parameters:
-        spike_times: np.ndarray of spike sample indices (absolute times)
-        ei: EI waveform [n_channels x T]
-        dat_path: path to the raw data file (modified or original)
-        ei_positions: electrode spatial positions [n_channels x 2]
-        start_sample: first sample index of the segment
-        segment_length: number of samples in the segment
-        dtype: data type of the raw file
-        n_channels: number of channels
-        window: waveform window around each spike (e.g. (-20, 60))
-        fit_offsets: tuple defining fitting range relative to peak (e.g. (-5, 10))
-        p2p_threshold: min peak-to-peak to include a channel
-
-    Returns:
-        all_channel_fit_params: dict[channel_idx] = array of fit parameters per spike
-    """
-    ei_p2p = ei.max(axis=1) - ei.min(axis=1)
-    selected_channels = np.where(ei_p2p > p2p_threshold)[0]
-    selected_channels = selected_channels[np.argsort(ei_p2p[selected_channels])[::-1]]
-
-    tree = KDTree(ei_positions)
-
-    valid_spikes = [s for s in spike_times if (s + window[0] >= start_sample) and (s + window[1] < start_sample + segment_length)]
-    valid_spikes = np.array(valid_spikes)
-
-    all_channel_fit_params = {ch: None for ch in selected_channels}
-
-    for ch_idx in selected_channels:
-        ch_coord = ei_positions[ch_idx]
-        neighbor_dists, neighbor_idxs = tree.query(ch_coord, k=6)
-        neighbor_idxs = neighbor_idxs[neighbor_dists > 0]
-
-        valid_neighbors = [idx for idx in neighbor_idxs if idx in all_channel_fit_params and all_channel_fit_params[idx] is not None]
-
-        if len(valid_neighbors) == 0:
-            fallback_params = None
-        else:
-            fallback_params = {}
-            for i, spike_time in enumerate(valid_spikes):
-                per_spike_vals = [all_channel_fit_params[idx][i] for idx in valid_neighbors]
-                fallback_params[spike_time] = np.mean(per_spike_vals, axis=0)
-
-        channel_params = run_template_subtraction_on_channel.run_template_subtraction_on_channel(
-            channel_idx=ch_idx,
-            final_spike_times=spike_times,
-            ei_waveform=ei[ch_idx],
-            dat_path=dat_path,
-            start_sample=start_sample,
-            segment_length=segment_length,
-            dtype=dtype,
-            n_channels=n_channels,
-            window=window,
-            fit_offsets=fit_offsets,
-            fallback_fit_params=fallback_params,
-            diagnostic_plot_spikes=None
-        )
-        all_channel_fit_params[ch_idx] = channel_params
-
-    return all_channel_fit_params
-
-
-
-
-def run_template_subtraction_on_channel_accumulate(
-    channel_idx,
-    final_spike_times,
-    ei_waveform,
-    dat_path_chmajor,
-    total_samples,
-    dtype,
-    window,
-    fit_offsets,
-    max_chunk_len=100_000,
-    fallback_fit_params=None,
-    diagnostic_plot_spikes=None
-):
-    """
-    Subtracts warped template fits from a channel-major data file, accumulating residuals.
-
-    Returns:
-    - fit_params_per_spike: list of [A, w, delta] per spike
-    - snippets_to_write: (n_spikes, snippet_len) int16 array of residuals
-    - write_locations: array of start times (sample indices) for each residual
-    """
-
-    pre, post = window
-    snip_len = post - pre + 1
-
-    ei_trace = ei_waveform.copy()
-    ei_trace -= np.mean(ei_trace[:5])
-    t_template = np.arange(len(ei_trace))
-    t_peak_template = np.argmin(ei_trace)
-
-    valid_spikes = [s for s in final_spike_times if (s + pre >= 0) and (s + post < total_samples)]
-    valid_spikes = np.array(valid_spikes)
-
-    snippets_to_write = []
-    write_locations = []
-    fit_params_per_spike = []
-
-    with open(dat_path_chmajor, 'rb') as f:
-        spike_idx = 0
-        while spike_idx < len(valid_spikes):
-            s_start = valid_spikes[spike_idx]
-            chunk_start = s_start + pre
-            chunk_end = min(chunk_start + max_chunk_len, total_samples)
-
-            chunk_spikes = []
-            while (spike_idx < len(valid_spikes)) and (valid_spikes[spike_idx] + post < chunk_end):
-                chunk_spikes.append(valid_spikes[spike_idx])
-                spike_idx += 1
-
-            if len(chunk_spikes) == 0:
-                spike_idx += 1
-                continue
-
-            chunk_spikes = np.array(chunk_spikes)
-
-            offset = (channel_idx * total_samples + chunk_start) * np.dtype(dtype).itemsize
-            n_time = chunk_end - chunk_start
-            f.seek(offset)
-            chunk_data = np.fromfile(f, dtype=dtype, count=n_time).astype(np.float32)
-
-            baseline_offset = np.mean(chunk_data)
-            chunk_data -= baseline_offset
-
-            t = np.arange(snip_len)
-            t0 = max(t_peak_template + fit_offsets[0], 0)
-            t1 = min(t_peak_template + fit_offsets[1], snip_len - 1)
-
-            A_vals = np.linspace(0.8, 1.2, 5)
-            w_vals = np.linspace(0.95, 1.05, 5)
-            d_vals = np.linspace(-0.5, 0.5, 5)
-
-            for s in chunk_spikes:
-                t_start = s + pre
-                local_offset = t_start - chunk_start
-                raw_snip = chunk_data[local_offset:local_offset + snip_len]
-
-                best_err = np.inf
-                best_fit = None
-                best_params = None
-
-                for A in A_vals:
-                    for w in w_vals:
-                        for delta in d_vals:
-                            t_shifted = (t - t_peak_template - delta) / w + t_peak_template
-                            t_shifted = np.clip(t_shifted, 0, len(ei_trace) - 1)
-                            warped = interp1d(t_template, ei_trace, kind='linear', bounds_error=False)(t_shifted)
-                            fit = A * warped
-                            err = np.sum((raw_snip[t0:t1 + 1] - fit[t0:t1 + 1]) ** 2)
-                            if err < best_err:
-                                best_err = err
-                                best_fit = fit
-                                best_params = (A, w, delta)
-
-                A_fit, w_fit, delta_fit = best_params
-                template_fit = best_fit
-
-                if fallback_fit_params is not None and (best_params is None or best_err > 1e6) and s in fallback_fit_params:
-                    A_fit, w_fit, delta_fit = fallback_fit_params[s]
-                    template_fit = A_fit * ei_trace
-
-                residual = raw_snip - template_fit
-                residual += baseline_offset
-                residual_clipped = np.clip(residual, -32768, 32767).astype(np.int16)
-
-                if diagnostic_plot_spikes is not None and s in set(diagnostic_plot_spikes):
-                    plt.figure(figsize=(10, 3))
-                    plt.plot(raw_snip, label='Raw', color='black')
-                    plt.plot(template_fit, label='Fit', color='red')
-                    plt.plot(residual, label='Residual', color='green')
-                    plt.axvline(t_peak_template, linestyle='--', color='gray')
-                    plt.title(f"Channel {channel_idx}, Spike @ {s}")
-                    plt.legend()
-                    plt.grid(True)
-                    plt.tight_layout()
-                    plt.show()
-
-                snippets_to_write.append(residual_clipped)
-                write_locations.append(t_start)
-                fit_params_per_spike.append([A_fit, w_fit, delta_fit])
-
-    return fit_params_per_spike, np.stack(snippets_to_write), np.array(write_locations)
-
-
-
-
-def subtract_pca_cluster_means(snippets, baselines, spike_times, segment_len=100_000, n_clusters=5, offset_window=(-5,10)):
+def subtract_pca_cluster_means_ram(snippets, baselines, spike_times, segment_len=100_000, n_clusters=5, offset_window=(-5,10)):
     """
     Subtracts PCA-clustered mean waveforms from baseline-corrected spike snippets for a single channel.
 
@@ -888,45 +1088,51 @@ def subtract_pca_cluster_means(snippets, baselines, spike_times, segment_len=100
     return residuals, scale_factors, cluster_ids
 
 
+import numpy as np
 
-
-def apply_residuals_to_channel_major(
-    dat_path_chmajor,
-    residual_snips_per_channel,
-    write_locs,
-    selected_channels,
-    total_samples,
-    dtype=np.int16,
-    n_channels=512
+def apply_residuals(
+    raw_data: np.ndarray = None,
+    dat_path: str = None,
+    residual_snips_per_channel: dict = None,
+    write_locs: np.ndarray = None,
+    selected_channels: np.ndarray = None,
+    total_samples: int = None,
+    dtype: np.dtype = np.int16,
+    n_channels: int = 512,
+    is_ram: bool = False,
+    is_disk: bool = False
 ):
     """
-    Subtracts residual waveforms from a channel-major .dat file in-place.
+    Applies residual snippets to time-major data (RAM and/or disk).
 
     Parameters:
-    - dat_path_chmajor: Path to channel-major binary file
-    - residual_snips_per_channel: dict {channel_idx: (n_spikes, snip_len) int16 array}
-    - write_locs: array of sample indices
-    - selected_channels: list of channels to process
-    - total_samples: total number of timepoints in recording
-    - dtype: data type (default np.int16)
+        raw_data: RAM array [time, channels] (optional, required if is_ram)
+        dat_path: Path to time-major .dat file (optional, required if is_disk)
+        residual_snips_per_channel: {channel: [n_spikes, snip_len] int16 array}
+        write_locs: Spike center locations [n_spikes]
+        selected_channels: List/array of channels to update
+        total_samples: Number of timepoints in the recording
+        dtype: Data type of stored file
+        n_channels: Total number of channels
+        is_ram: If True, modify raw_data
+        is_disk: If True, modify file at dat_path
 
     Returns:
-    - None
+        None
     """
+    if not is_ram and not is_disk:
+        raise ValueError("At least one of is_ram or is_disk must be True.")
 
-    # Use correct shape based on full dataset, not subset of processed channels
-    data = np.memmap(
-        dat_path_chmajor,
-        dtype=dtype,
-        mode='r+',
-        shape=(n_channels, total_samples)
-    )
+    if is_disk:
+        data_disk = np.memmap(dat_path, dtype=dtype, mode='r+', shape=(total_samples, n_channels))
+    else:
+        data_disk = None
 
-    for ch_idx in selected_channels:
-        residuals = residual_snips_per_channel[ch_idx]
+    for ch in selected_channels:
+        residuals = residual_snips_per_channel[ch]
 
         if residuals.shape[0] != len(write_locs):
-            raise ValueError(f"Mismatch in spikes and write_locs for channel {ch_idx}")
+            raise ValueError(f"Mismatch between residuals and write_locs for channel {ch}")
 
         for i, (snip, loc) in enumerate(zip(residuals, write_locs)):
             end = loc + snip.shape[0]
@@ -934,147 +1140,21 @@ def apply_residuals_to_channel_major(
                 print(f"    Skipping spike {i} (ends at {end}, beyond total_samples)")
                 continue
 
-            data[ch_idx, loc:end] = snip
+            if is_ram:
+                raw_data[loc:end, ch] = snip
+            if is_disk:
+                data_disk[loc:end, ch] = snip
 
-    data.flush()
-    del data
-
+    if is_disk:
+        data_disk.flush()
+        del data_disk
 
 
 import numpy as np
 from scipy.signal import correlate
 
-def estimate_lags_by_xcorr(snippets: np.ndarray, peak_channel_idx: int, window: tuple = (-5, 10), max_lag: int = 3) -> np.ndarray:
-    """
-    Estimate lag for each spike by cross-correlating with the mean waveform of the peak channel.
-
-    Parameters:
-        snippets: np.ndarray
-            Spike snippets of shape (N, C, T)
-        peak_channel_idx: int
-            Index of the peak (reference) channel
-        window: tuple
-            Relative window around the peak to consider for alignment
-        max_lag: int
-            Maximum lag to consider for alignment
-
-    Returns:
-        np.ndarray
-            Array of integer lags for each spike
-    """
-    N, C, T = snippets.shape
-    waveform = snippets[:, peak_channel_idx, :].mean(axis=0)
-    peak_idx = np.argmax(np.abs(waveform))
 
 
-    win_start = peak_idx + window[0]
-    win_end = peak_idx + window[1]
-
-    if win_start < 0 or win_end > T:
-        # import matplotlib.pyplot as plt
-
-        # plt.figure(figsize=(10, 4))
-        # plt.plot(waveform, label="Mean waveform")
-        # plt.axvline(peak_idx, color='red', linestyle='--', label=f'Peak @ {peak_idx}')
-        # plt.axvspan(win_start, win_end, color='orange', alpha=0.3, label=f'Window ({win_start}-{win_end})')
-        # plt.title("Mean waveform on peak channel")
-        # plt.xlabel("Sample")
-        # plt.ylabel("Amplitude")
-        # plt.legend()
-        # plt.grid(True)
-        # plt.tight_layout()
-        # plt.show()
-
-        # Raise exception with details
-        raise ValueError(f"Window around peak ({win_start}:{win_end}) is out of bounds for waveform length {T}")
-
-
-    ei_win = waveform[win_start:win_end]
-
-    lags = np.zeros(N, dtype=int)
-    for i in range(N):
-        snip = snippets[i, peak_channel_idx, win_start - max_lag : win_end + max_lag].copy()
-        if snip.shape[0] < ei_win.shape[0] + 2 * max_lag:
-            lags[i] = 0  # skip if snippet is too short
-            continue
-        corr = correlate(snip, ei_win, mode='valid')
-        lag = np.argmax(corr) - max_lag
-        lags[i] = lag
-
-    return lags
-
-
-def suppress_artifacts_in_dat(
-    dat_path_chmajor,
-    artifact_locs,
-    n_channels,
-    total_samples,
-    dtype=np.int16,
-    suppress_window=(-20, 50),
-    baseline_window=(-100, -20, 50, 150)
-):
-    """
-    Suppress artifacts by flattening the trace around each artifact location.
-
-    Parameters:
-    - dat_path_chmajor: Path to the channel-major .dat file
-    - artifact_locs: Dictionary of {channel_index: list of sample indices (int)}
-    - n_channels: Total number of channels
-    - total_samples: Total number of samples in the file
-    - dtype: Data type of the file (default: np.int16)
-    - suppress_window: Tuple (start, end) relative to artifact sample for replacement
-    - baseline_window: Tuple (pre_start, pre_end, post_start, post_end) relative to artifact
-
-    Returns:
-    - None. The file is modified in-place.
-    """
-
-    data = np.memmap(dat_path_chmajor, dtype=dtype, mode='r+', shape=(n_channels, total_samples))
-
-    suppress_start, suppress_end = suppress_window
-    pre_start_rel, pre_end_rel, post_start_rel, post_end_rel = baseline_window
-
-    for ch, locs in artifact_locs.items():
-        for s in locs:
-            start_fill = s + suppress_start
-            end_fill = s + suppress_end
-            pre_start = s + pre_start_rel
-            pre_end = s + pre_end_rel
-            post_start = s + post_start_rel
-            post_end = s + post_end_rel
-
-            if pre_start < 0 or post_end > total_samples:
-                continue  # skip if out of bounds
-
-            pre = data[ch, pre_start:pre_end]
-            post = data[ch, post_start:post_end]
-            flat_value = int(np.round(np.mean(np.concatenate([pre, post]))))
-
-            data[ch, start_fill:end_fill] = flat_value
-
-    data.flush()
-
-
-
-def clipped_hist(ax, scores, threshold, title, bins=100):
-    scores = np.asarray(scores)
-    valid = scores[np.isfinite(scores)]
-
-    if valid.size == 0:
-        ax.text(0.5, 0.5, 'No valid data', transform=ax.transAxes,
-                ha='center', va='center', fontsize=10, color='red')
-        ax.set_title(title)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        return
-
-    counts, bins = np.histogram(valid, bins=bins)
-    cutoff = np.sort(counts)[-4] if len(counts) >= 4 else max(counts)
-    ax.hist(valid, bins=bins, alpha=0.6, color='gray')
-    ax.axvline(threshold, color='red', linestyle='--', label=f"Threshold = {threshold:.2f}")
-    ax.set_ylim(0, cutoff * 1.1)
-    ax.set_title(title)
-    ax.grid(True)
 
 
 def plot_unit_diagnostics(
@@ -1085,6 +1165,8 @@ def plot_unit_diagnostics(
     sim_matrix_pre: np.ndarray,
     cluster_eis_pre: np.ndarray,
     spikes_for_plot_pre: np.ndarray,
+    n_bad_channels_pre: np.ndarray,
+    contributing_original_ids_pre: np.ndarray,
     mean_score: np.ndarray,
     valid_score: np.ndarray,
     mean_scores_at_spikes: np.ndarray,
@@ -1174,11 +1256,21 @@ def plot_unit_diagnostics(
 
     ax2 = fig.add_subplot(row1_gs[1])
     ax2.set_title("Similarity Matrix (Pre)")
+
+    label_matrix = np.empty_like(sim_matrix_pre, dtype=object)
+    n = sim_matrix_pre.shape[0]
+    for i in range(n):
+        for j in range(n):
+            score = sim_matrix_pre[i, j]
+            n_bad = n_bad_channels_pre[i, j]
+            label_matrix[i, j] = f"{score:.2f}/{n_bad}"
+
+
     tb = Table(ax2, bbox=[0.2, 0.2, 0.8, 0.8])
     n = sim_matrix_pre.shape[0]
     for i in range(n):
         for j in range(n):
-            tb.add_cell(i, j, 1/n, 1/n, text=f"{sim_matrix_pre[i, j]:.2f}", loc='center')
+            tb.add_cell(i, j, 1/n, 1/n, text=label_matrix[i, j], loc='center')
     for i in range(n):
         tb.add_cell(i, -1, 1/n, 1/n, text=str(i), loc='right', edgecolor='none')
         tb.add_cell(-1, i, 1/n, 1/n, text=str(i), loc='center', edgecolor='none')
@@ -1205,6 +1297,8 @@ def plot_unit_diagnostics(
         max_idx = np.unravel_index(np.abs(sta).argmax(), sta.shape)
         # Display STA frame at peak time
         peak_frame = max_idx[3]
+        if peak_frame>7 or peak_frame<3:
+            peak_frame = 4
         rgb = sta[:, :, :, peak_frame]
         vmax = np.max(np.abs(sta)) * 2
         norm_rgb = rgb / vmax + 0.5
@@ -1233,6 +1327,8 @@ def plot_unit_diagnostics(
         max_idx = np.unravel_index(np.abs(sta).argmax(), sta.shape)
         # Display STA frame at peak time
         peak_frame = max_idx[3]
+        if peak_frame>7 or peak_frame<3:
+            peak_frame = 4
         rgb = sta[:, :, :, peak_frame]
         vmax = np.max(np.abs(sta)) * 2
         norm_rgb = rgb / vmax + 0.5
@@ -1261,6 +1357,8 @@ def plot_unit_diagnostics(
         max_idx = np.unravel_index(np.abs(sta).argmax(), sta.shape)
         # Display STA frame at peak time
         peak_frame = max_idx[3]
+        if peak_frame>7 or peak_frame<3:
+            peak_frame = 4
         rgb = sta[:, :, :, peak_frame]
         vmax = np.max(np.abs(sta)) * 2
         norm_rgb = rgb / vmax + 0.5
@@ -1291,7 +1389,7 @@ def plot_unit_diagnostics(
         ax=ei_row_pre
     )
 
-    ei_row_pre.set_title(f"Cluster EIs; spikes chosen {len(mean_scores_at_spikes)}")
+    ei_row_pre.set_title(f"Cluster EIs; clusters {contributing_original_ids_pre} meerged; total spikes {len(mean_scores_at_spikes)}")
 
     # for i in range(len(ei_clusters_pre)):
     #     ax = fig.add_subplot(ei_row_pre[i])
@@ -1331,18 +1429,18 @@ def plot_unit_diagnostics(
         ax.set_title(title)
         ax.grid(True)
 
+    if mean_score is not None:
+        ax3a = fig.add_subplot(gs[2, 0])
+        clipped_hist(ax3a, mean_score, mean_thresh, "Mean Score (all)")
 
-    ax3a = fig.add_subplot(gs[2, 0])
-    clipped_hist(ax3a, mean_score, mean_thresh, "Mean Score (all)")
+        ax3b = fig.add_subplot(gs[2, 1])
+        clipped_hist(ax3b, mean_scores_at_spikes, mean_thresh, f"Mean Score ({len(mean_scores_at_spikes)} spikes)")
 
-    ax3b = fig.add_subplot(gs[2, 1])
-    clipped_hist(ax3b, mean_scores_at_spikes, mean_thresh, f"Mean Score ({len(mean_scores_at_spikes)} spikes)")
+        ax3c = fig.add_subplot(gs[2, 2])
+        clipped_hist(ax3c, valid_score, valid_thresh, "Valid Channels (all)", bins=np.arange(0, selected_channels_count + 2))
 
-    ax3c = fig.add_subplot(gs[2, 2])
-    clipped_hist(ax3c, valid_score, valid_thresh, "Valid Channels (all)", bins=np.arange(0, selected_channels_count + 2))
-
-    ax3d = fig.add_subplot(gs[2, 3])
-    clipped_hist(ax3d, valid_scores_at_spikes, valid_thresh, "Valid Channels (spikes)", bins=np.arange(0, selected_channels_count + 2))
+        ax3d = fig.add_subplot(gs[2, 3])
+        clipped_hist(ax3d, valid_scores_at_spikes, valid_thresh, "Valid Channels (spikes)", bins=np.arange(0, selected_channels_count + 2))
 
     # --- Row 4: Lags and bad spikes ---
     row4_gs = gridspec.GridSpecFromSubplotSpec(1, 5, subplot_spec=gs[3, :])
@@ -1464,6 +1562,8 @@ def plot_unit_diagnostics(
         max_idx = np.unravel_index(np.abs(sta).argmax(), sta.shape)
         # Display STA frame at peak time
         peak_frame = max_idx[3]
+        if peak_frame>7 or peak_frame<3:
+            peak_frame = 4
         rgb = sta[:, :, :, peak_frame]
         vmax = np.max(np.abs(sta)) * 2
         norm_rgb = rgb / vmax + 0.5
@@ -1491,6 +1591,8 @@ def plot_unit_diagnostics(
         max_idx = np.unravel_index(np.abs(sta).argmax(), sta.shape)
         # Display STA frame at peak time
         peak_frame = max_idx[3]
+        if peak_frame>7 or peak_frame<3:
+            peak_frame = 4
         rgb = sta[:, :, :, peak_frame]
         vmax = np.max(np.abs(sta)) * 2
         norm_rgb = rgb / vmax + 0.5
@@ -1601,6 +1703,8 @@ def plot_unit_diagnostics(
 
         # Display STA frame at peak time
         peak_frame = max_idx[3]
+        if peak_frame>7 or peak_frame<3:
+            peak_frame = 4
         rgb = sta[:, :, :, peak_frame]
         vmax = np.max(np.abs(sta)) * 2
         norm_rgb = rgb / vmax + 0.5
@@ -1614,5 +1718,5 @@ def plot_unit_diagnostics(
 
     plt.subplots_adjust(top=0.97, bottom=0.03, left=0.05, right=0.98, hspace=0.5, wspace=0.25)
     os.makedirs(output_path, exist_ok=True)
-    fig.savefig(os.path.join(output_path, f"unit_{unit_id:03d}_diagnostics.png"), dpi=150)
+    fig.savefig(os.path.join(output_path, f"unit_{unit_id:03d}_diagnostics_ram.png"), dpi=150)
     plt.close(fig)

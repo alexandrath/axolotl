@@ -67,7 +67,15 @@ def analyze_clusters(clusters,
         spikes_sec = spike_samples / sampling_rate
 
         # EI
-        snips = extract_snippets(dat_path, spike_samples, window=(-20, 60), n_channels=512, dtype='int16')
+        if isinstance(dat_path, np.ndarray):
+            snips_full = dat_path
+            snips = snips_full[:,:,inds].copy()
+        elif isinstance(dat_path, str):
+            snips = extract_snippets(dat_path, spike_samples, window=(-20, 60), n_channels=512, dtype='int16')
+        else:
+            print("Unknown type:", type(dat_path))
+
+        
         ei = np.mean(snips, axis=2)
         ei -= np.mean(ei[:, :5], axis=1, keepdims=True)
 

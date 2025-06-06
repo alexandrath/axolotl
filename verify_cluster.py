@@ -48,13 +48,24 @@ def plot_kmeans_pca(pcs, labels):
     plt.show()
 
 def verify_cluster(spike_times, dat_path, params):
+
     window = params.get('window', (-20, 60))
+
+    if isinstance(dat_path, np.ndarray):
+        snips = dat_path
+    elif isinstance(dat_path, str):
+        snips = extract_snippets(dat_path, spike_times, window)
+    else:
+        print("Unknown type:", type(dat_path))
+
+
+    
     min_spikes = params.get('min_spikes', 100)
     k_start = params.get('k_start', 8)
     k_refine = params.get('k_refine', 2)
     ei_sim_threshold = params.get('ei_sim_threshold', 0.95)
 
-    snips = extract_snippets(dat_path, spike_times, window)
+    
     full_inds = np.arange(snips.shape[2])
 
     cluster_pool = [{'inds': full_inds, 'depth': 0}]
