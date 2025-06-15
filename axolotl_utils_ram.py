@@ -26,7 +26,8 @@ from compute_sta_from_spikes import compute_sta_chunked
 from benchmark_c_rgb_generation import RGBFrameGenerator
 from matplotlib import rcParams
 import itertools
-
+from scipy.stats import trim_mean
+from sklearn.preprocessing import StandardScaler
 
 def compute_baselines_int16(raw_data, segment_len=100_000):
     """
@@ -54,6 +55,53 @@ def compute_baselines_int16(raw_data, segment_len=100_000):
     return baselines
 
 
+def compute_baselines_int16_deriv_robust(raw_data, segment_len=100_000, diff_thresh=50, trim_fraction=0.05):
+    """
+    Compute mean baseline per channel over non-overlapping segments,
+    using derivative masking + trimmed mean to suppress spike influence.
+
+    Input:
+    - raw_data: [T, C], int16
+    - segment_len: samples per segment (default 100,000)
+    - diff_thresh: derivative threshold in raw units (default 50 µV/sample)
+    - trim_fraction: fraction to trim from both ends (default 5%)
+
+    Output:
+    - baselines: [C, n_segments] float32
+    """
+    total_samples, n_channels = raw_data.shape
+    n_segments = (total_samples + segment_len - 1) // segment_len
+
+    baselines = np.zeros((n_channels, n_segments), dtype=np.float32)
+
+    for seg_idx in range(n_segments):
+        start = seg_idx * segment_len
+        end = min(start + segment_len, total_samples)
+        segment = raw_data[start:end, :]  # [S, C]
+
+        if segment.shape[0] < 2:
+            baselines[:, seg_idx] = 0  # or np.nan
+            continue
+
+        # Compute absolute derivative
+        diff_segment = np.abs(np.diff(segment, axis=0))  # [S-1, C]
+        # Pad to match original length
+        diff_segment = np.vstack([diff_segment, diff_segment[-1]])  
+
+        # Mask: keep only low-derivative points
+        flat_mask = diff_segment < diff_thresh  # [S, C]
+
+        # Apply mask and compute trimmed mean per channel
+        for c in range(n_channels):
+            flat_vals = segment[flat_mask[:, c], c].astype(np.float32)
+            if len(flat_vals) > 0:
+                baselines[c, seg_idx] = trim_mean(flat_vals, proportiontocut=trim_fraction)
+            else:
+                baselines[c, seg_idx] = 0  # fallback
+
+    return baselines
+
+
 
 def find_dominant_channel_ram(
     raw_data: np.ndarray,
@@ -62,22 +110,25 @@ def find_dominant_channel_ram(
     peak_window: int = 30,
     top_k_neg: int = 20,
     top_k_events: int = 5,
-    seed: int = 42
-) -> int:
+    seed: int = 42,
+    use_negative_peak: bool = False
+) -> list:
     """
-    Identify the channel with the largest spike-like events from RAM-resident time-major data.
+    Identify the dominant channels based on spike-like events.
 
     Parameters:
-        raw_data: ndarray of shape [T, C] (time-major)
+        raw_data: ndarray of shape [T, C]
         segment_len: number of samples per segment
-        n_segments: how many segments to check (1 fixed start + N-1 random)
+        n_segments: how many segments to check
         peak_window: half-width for spike amplitude window
         top_k_neg: number of negative peaks to keep per channel per segment
         top_k_events: number of top amplitudes to average per channel
-        seed: RNG seed for reproducibility
+        seed: RNG seed
+        use_negative_peak: if True, use negative peak value only as score (more negative = stronger)
+                           if False, use peak-to-peak amplitude
 
     Returns:
-        Index of the dominant channel
+        List of indices of top channels
     """
     total_samples, n_channels = raw_data.shape
     rng = np.random.default_rng(seed)
@@ -91,11 +142,11 @@ def find_dominant_channel_ram(
     channel_amplitudes = [[] for _ in range(n_channels)]
 
     for start in start_indices:
-        segment = raw_data[start:start + segment_len, :]  # [seg_len, C]
-        
+        segment = raw_data[start:start + segment_len, :]
+
         for ch in range(n_channels):
-            trace = segment[:, ch]  # int16
-            trace_centered = trace - np.mean(trace)  # still int16 in effect
+            trace = segment[:, ch]
+            trace_centered = trace - np.mean(trace)
 
             neg_peaks, _ = find_peaks(-trace_centered, distance=20)
             if len(neg_peaks) == 0:
@@ -105,16 +156,20 @@ def find_dominant_channel_ram(
             selected_peaks = neg_peaks[sorted_idx[:top_k_neg]]
 
             for peak_idx in selected_peaks:
-                win_start = max(peak_idx - peak_window, 0)
-                win_end = min(peak_idx + peak_window + 1, segment_len)
 
-                local_window = trace_centered[win_start:win_end].astype(np.float32)
-                local_max = np.max(local_window)
                 valley = trace_centered[peak_idx].astype(np.float32)
-                amplitude = local_max - valley
+
+                if use_negative_peak:
+                    amplitude = -valley  # more negative valley → higher score
+                else:
+                    win_start = max(peak_idx - peak_window, 0)
+                    win_end = min(peak_idx + peak_window + 1, segment_len)
+
+                    local_window = trace_centered[win_start:win_end].astype(np.float32)
+                    local_max = np.max(local_window)
+                    amplitude = local_max - valley  # peak-to-peak
 
                 channel_amplitudes[ch].append(amplitude)
-
 
     # Score: mean of top_k_events per channel
     mean_amplitudes = np.zeros(n_channels, dtype=np.float32)
@@ -123,21 +178,15 @@ def find_dominant_channel_ram(
         if len(amps) > 0:
             mean_amplitudes[ch] = np.mean(np.sort(amps)[-top_k_events:])
 
-    # --- Return top N channels in descending order of score ---
-    top_n = 10  # hardcoded for now
-    sorted_indices = np.argsort(mean_amplitudes)[::-1]  # descending order
-    top_channels = sorted_indices[:top_n].tolist()
+    sorted_indices = np.argsort(mean_amplitudes)[::-1]
+    top_channels = sorted_indices[:10].tolist()
 
     return top_channels
 
-    # ref_channel = int(np.argmax(mean_amplitudes))
-    # return ref_channel
 
 
 
-from scipy.signal import find_peaks
-from scipy.ndimage import uniform_filter1d
-import numpy as np
+
 
 def estimate_spike_threshold_ram(
     raw_data: np.ndarray,
@@ -145,56 +194,139 @@ def estimate_spike_threshold_ram(
     window: int = 30,
     total_samples_to_read: int = 10_000_000,
     refractory: int = 30,
-    top_n: int = 100
+    top_n: int = 100,
+    threshold_scale: float = 0.5
 ) -> tuple[float, np.ndarray]:
     """
-    Estimate spike threshold from RAM-resident time-major raw_data.
+    Estimate spike threshold and detect spike times using adaptive threshold crossing logic.
 
     Parameters:
-        raw_data: ndarray of shape [T, C] (int16)
-        ref_channel: index of the dominant channel
-        window: samples around negative peak for local max
-        total_samples_to_read: number of samples to analyze
-        refractory: minimum spacing between detected spikes
-        top_n: number of strongest events used to estimate threshold
+        raw_data: [T, C] int16 array
+        ref_channel: channel to analyze
+        window: unused now but kept for API consistency
+        total_samples_to_read: length of trace to analyze
+        refractory: minimum spacing between spikes
+        top_n: used to estimate threshold from largest events
+        threshold_scale: scaling for final detection threshold
 
     Returns:
-        threshold: half the mean of top-N negative peaks
-        spike_times: indices of suprathreshold events
+        threshold: estimated threshold
+        spike_times: array of detected spike centers (global minima within threshold-crossing windows)
     """
     trace = raw_data[:total_samples_to_read, ref_channel].astype(np.float32)
     trace -= np.mean(trace)
 
-    neg_peaks, _ = find_peaks(-trace, distance=2 * refractory)
+    segment_len = 20000  # 1s at 20kHz
+    n_segments = len(trace) // segment_len
 
-    event_amplitudes = []
-    event_indices = []
+    trace_filtered = np.empty_like(trace)
 
-    for idx in neg_peaks:
-        win_start = max(idx - window, 0)
-        win_end = min(idx + window + 1, len(trace))
-        pos_peak = np.max(trace[win_start:win_end])
-        amp = pos_peak - trace[idx]
-        event_amplitudes.append(amp)
-        event_indices.append(idx)
+    for i in range(n_segments):
+        start = i * segment_len
+        end = start + segment_len
+        segment = trace[start:end]
+        segment_mean = np.mean(segment)
+        trace_filtered[start:end] = segment - segment_mean
 
-    event_amplitudes = np.array(event_amplitudes)
-    event_indices = np.array(event_indices)
 
-    if len(event_amplitudes) >= top_n:
-        top_idx = np.argsort(event_amplitudes)[-top_n:]
+    # --- Estimate threshold from top-N negative peaks ---
+    neg_peaks, _ = find_peaks(-trace_filtered, distance=2 * refractory)
+    peak_vals = trace_filtered[neg_peaks]
+    if len(peak_vals) >= top_n:
+        top_idx = np.argsort(np.abs(peak_vals))[-top_n:]
     else:
-        top_idx = np.argsort(event_amplitudes)
+        top_idx = np.argsort(np.abs(peak_vals))
+    threshold = threshold_scale * np.mean(np.abs(peak_vals[top_idx]))
+    # threshold = 50
 
-    ref_neg_peaks = trace[event_indices[top_idx]]
-    threshold = 0.5 * np.mean(np.abs(ref_neg_peaks))
+    # --- Detect threshold-crossing windows ---
+    above = trace_filtered > -threshold
+    crossings_down = np.where(above[:-1] & ~above[1:])[0] + 1
+    crossings_up   = np.where(~above[:-1] & above[1:])[0] + 1
 
-    baseline_window = 20001  # ~1s at 20kHz
-    trace_filtered = trace - uniform_filter1d(trace, size=baseline_window, mode='nearest')
-    selected_peaks = [idx for idx in event_indices if trace_filtered[idx] < -threshold]
-    spike_times = np.array(selected_peaks)
+    # --- Pair crossings into spike windows ---
+    entry_ptr, exit_ptr = 0, 0
+    spike_windows = []
+
+    while entry_ptr < len(crossings_down) and exit_ptr < len(crossings_up):
+        entry = crossings_down[entry_ptr]
+        exit = crossings_up[exit_ptr]
+
+        if exit <= entry:
+            exit_ptr += 1
+            continue
+
+        spike_windows.append((entry, exit))
+        entry_ptr += 1
+        exit_ptr += 1
+
+    # --- Find minima in each window ---
+    spike_times = []
+    last_spike = -np.inf
+
+    for entry, exit in spike_windows:
+        if exit - entry < 1:
+            continue
+
+        min_idx = np.argmin(trace_filtered[entry:exit]) + entry
+        if min_idx - last_spike > refractory:
+            spike_times.append(min_idx)
+            last_spike = min_idx
+
+    spike_times = np.array(spike_times)
+
+    # --- Enforce spike count cap ---
+    max_spikes = 50000
+
+    if len(spike_times) > max_spikes:
+        spike_amps = -trace_filtered[spike_times]  # negate because spikes are negative
+        top_idx = np.argsort(spike_amps)[-max_spikes:]  # top N amplitudes
+        spike_times = spike_times[np.sort(top_idx)]  # preserve temporal order
+
+
+        # TEMP: check values at known missed spikes
+#     missed_spike_times = np.array([
+#             42099,  1008006,  1305723,  6505023,  9755242, 12277345, 12857675, 13192348,
+#             13439089, 14105963, 15881850, 16335736, 16385159, 16436369, 16562586, 17206720,
+#             17224743, 18191108, 18294350, 19138550, 20034161, 21572611, 22001075, 22542134,
+#             23148769, 23216961, 23356572, 23485098, 24394617, 24936663, 25230985, 25337944,
+#             25812998, 26706395, 27558521, 28022213, 28369137, 28469633, 28486336, 29716292,
+#             30211815, 32174362, 32316809, 32974069, 34168038, 34413741, 34426669, 34462695,
+#             34489819, 34903635, 35249228
+#     ])
+#  # fill in the 173 sample indices
+
+#     # Make sure you don't exceed the trace bounds
+#     import matplotlib.pyplot as plt
+
+#     for i, center in enumerate(missed_spike_times[:3]):
+#         win_start = max(center - 60, 0)
+#         win_end = min(center + 61, len(trace))
+#         t_range = np.arange(win_start, win_end)
+
+#         local_trace = trace[win_start:win_end]
+
+#         # Find event_indices within this window
+#         local_events = spike_times[(spike_times >= win_start) & (spike_times < win_end)]
+#         local_event_rel = local_events - win_start  # relative to window
+
+#         plt.figure(figsize=(10, 3))
+#         plt.plot(t_range - center, local_trace, label='Filtered trace', color='black')
+#         plt.axvline(0, color='red', linestyle='--', label='Missing spike center')
+#         plt.plot(local_event_rel - 60, local_trace[local_event_rel], 'g*', markersize=10, label='Detected peaks')
+#         plt.title(f"Missed spike #{i+1} at sample {center}")
+#         plt.xlabel("Time (samples relative to center)")
+#         plt.ylabel("Amplitude")
+#         plt.grid(True)
+#         plt.legend()
+#         plt.tight_layout()
+#         plt.show()
+
+
 
     return threshold, spike_times
+
+
 
 
 def extract_snippets_ram(
@@ -277,7 +409,7 @@ def sub_sample_align_ei(ei_template, ei_candidate, ref_channel, upsample=10, max
     aligned_candidate = np.zeros_like(ei_candidate)
     for ch in range(C):
         interp_func = interp1d(t, ei_candidate[ch], kind='cubic', bounds_error=False, fill_value=0.0)
-        shifted_time = t - fractional_shift
+        shifted_time = t + fractional_shift
         aligned_candidate[ch] = interp_func(shifted_time)
 
     return aligned_candidate, fractional_shift
@@ -348,6 +480,15 @@ def compare_ei_subtraction(ei_a, ei_b, max_lag=3, p2p_thresh=30.0):
     all_residuals = np.array(all_residuals)
     mean_residual = np.mean(all_residuals)
     max_abs_residual = np.max(np.abs(all_residuals))
+
+    import matplotlib.pyplot as plt
+
+
+    # plt.figure(figsize=(5,5))
+    # plt.plot(ei_a[ref_chan,:], color='black', alpha=0.8, linewidth=0.5)
+    # plt.plot(ei_b[ref_chan,:], color='blue', alpha=0.8, linewidth=0.5)
+    # plt.plot(aligned_b[ref_chan,:], color='red', alpha=0.8, linewidth=0.5)
+    # plt.show()
 
     return {
         'mean_residual': mean_residual,
@@ -428,40 +569,44 @@ def merge_similar_clusters(snips, labels, max_lag=3, p2p_thresh=30.0, amp_thresh
                 sim[i, j] = weighted_cos_sim
                 n_bad_channels[i, j] = len(neg_inds)
 
+
+
+
+
                 # noise_score = var_a[good_channels] / (p2p_a[good_channels] + 1e-3)
+                # if weighted_cos_sim <0.92:
+                #     fig, axs = plt.subplots(5, 1, figsize=(16, 8), sharex=True)
 
-                # fig, axs = plt.subplots(5, 1, figsize=(16, 8), sharex=True)
+                #     axs[0].plot(good_channels, snr_score, marker='o')
+                #     axs[0].set_ylabel("Normalized Variance (SNR)")
+                #     axs[0].set_title("Channel-wise Variance / P2P")
 
-                # axs[0].plot(good_channels, snr_score, marker='o')
-                # axs[0].set_ylabel("Normalized Variance (SNR)")
-                # axs[0].set_title("Channel-wise Variance / P2P")
+                #     axs[1].plot(good_channels, res, marker='o')
+                #     axs[1].set_ylabel("Residuals (B - A)")
+                #     axs[1].set_title("Channel-wise Mean Residuals")
 
-                # axs[1].plot(good_channels, res, marker='o')
-                # axs[1].set_ylabel("Residuals (B - A)")
-                # axs[1].set_title("Channel-wise Mean Residuals")
+                #     axs[2].plot(good_channels[snr_mask], cos_sim_masked * ch_weights_masked, marker='o')
+                #     axs[2].set_ylabel("Cosine Similarity")
+                #     axs[2].set_title(f"Weighted Cosine Similarity, mean = {weighted_cos_sim}")
+                #     axs[2].set_xlabel("Channel ID")
 
-                # axs[2].plot(good_channels, res_ab['per_channel_cosine_sim'] * p2p_a[good_channels], marker='o')
-                # axs[2].set_ylabel("Cosine Similarity")
-                # axs[2].set_title(f"Weighted Cosine Similarity, mean = {weighted_cos_sim}")
-                # axs[2].set_xlabel("Channel ID")
+                #     axs[3].plot(good_channels, res_ab['per_channel_cosine_sim'], marker='o')
+                #     axs[3].set_ylabel("Cosine Similarity")
+                #     axs[3].set_title(f"Unweighted Cosine Similarity, mean {np.mean(res_ab['per_channel_cosine_sim'])}")
+                #     axs[3].set_xlabel("Channel ID")
 
-                # axs[3].plot(good_channels, res_ab['per_channel_cosine_sim'], marker='o')
-                # axs[3].set_ylabel("Cosine Similarity")
-                # axs[3].set_title(f"Unweighted Cosine Similarity, mean {np.mean(res_ab['per_channel_cosine_sim'])}")
-                # axs[3].set_xlabel("Channel ID")
+                #     axs[4].plot(good_channels[snr_mask], ch_weights_masked, marker='o')
+                #     axs[4].set_ylabel("weights")
+                #     axs[4].set_title("Channel weights")
+                #     axs[4].set_xlabel("Channel ID")
 
-                # axs[4].plot(good_channels, adaptive_thresh, marker='o')
-                # axs[4].set_ylabel("adaptive_thresh")
-                # axs[4].set_title("adaptive_thresh")
-                # axs[4].set_xlabel("Channel ID")
+                #     for ax in axs:
+                #         ax.grid(True)
+                #         ax.set_xticks(good_channels)
+                #         ax.set_xticklabels(good_channels, rotation=45)
 
-                # for ax in axs:
-                #     ax.grid(True)
-                #     ax.set_xticks(good_channels)
-                #     ax.set_xticklabels(good_channels, rotation=45)
-
-                # plt.tight_layout()
-                # plt.show()
+                #     plt.tight_layout()
+                #     plt.show()
 
     # --- Merge clusters using precomputed similarities ---
     cluster_sizes = {i: len(cluster_spike_indices[i]) for i in cluster_ids}
@@ -476,36 +621,71 @@ def merge_similar_clusters(snips, labels, max_lag=3, p2p_thresh=30.0, amp_thresh
         if i in assigned:
             continue
 
-        i_idx = id_to_index[i]
-        base_inds = cluster_spike_indices[i]
-        group = list(base_inds)
+        base_group = [i]
         assigned.add(i)
 
-        for j in sorted_cluster_ids:
-            if j in assigned or j == i:
-                continue
+        # Try to grow the group transitively via the star logic
+        added = True
+        while added:
+            added = False
+            for j in sorted_cluster_ids:
+                if j in assigned:
+                    continue
 
-            j_idx = id_to_index[j]
-            sim_ij = sim[i_idx, j_idx]
-            n_bad = n_bad_channels[i_idx, j_idx]
+                # Check similarity to ANY already-accepted cluster in the group
+                for existing in base_group:
+                    sim_ij = sim[existing, j]
+                    n_bad = n_bad_channels[existing, j]
 
-            if sim_ij >= 0.95 and n_bad <= 4:
-                accept = True
-            elif sim_ij >= 0.90 and n_bad <= 2:
-                accept = True
-            elif sim_ij >= cos_thresh and n_bad == 0:
-                accept = True
-            else:
-                accept = False
+                    accept = False
+                    if sim_ij >= 0.95 and n_bad <= 6:
+                        accept = True
+                    elif sim_ij >= 0.85 and n_bad <= 4:
+                        accept = True
+                    elif sim_ij >= cos_thresh and n_bad == 2:
+                        accept = True
 
-            if accept:
-                group.extend(cluster_spike_indices[j])
-                assigned.add(j)
-            # if n_bad == 0 and sim_ij >= cos_thresh:
-            #     group.extend(cluster_spike_indices[j])
-            #     assigned.add(j)
+                    if accept:
+                        base_group.append(j)
+                        assigned.add(j)
+                        added = True
+                        break  # Stop checking other members once one match is found
 
-        merged_clusters.append(np.sort(np.array(group)))
+        # Merge all spikes from group
+        merged_spikes = np.concatenate([cluster_spike_indices[k] for k in base_group])
+        merged_clusters.append(np.sort(merged_spikes))
+
+    # for i in sorted_cluster_ids:
+    #     if i in assigned:
+    #         continue
+
+    #     i_idx = id_to_index[i]
+    #     base_inds = cluster_spike_indices[i]
+    #     group = list(base_inds)
+    #     assigned.add(i)
+
+    #     for j in sorted_cluster_ids:
+    #         if j in assigned or j == i:
+    #             continue
+
+    #         j_idx = id_to_index[j]
+    #         sim_ij = sim[i_idx, j_idx]
+    #         n_bad = n_bad_channels[i_idx, j_idx]
+
+    #         if sim_ij >= 0.95 and n_bad <= 4:
+    #             accept = True
+    #         elif sim_ij >= 0.90 and n_bad <= 2:
+    #             accept = True
+    #         elif sim_ij >= cos_thresh and n_bad == 0:
+    #             accept = True
+    #         else:
+    #             accept = False
+
+    #         if accept:
+    #             group.extend(cluster_spike_indices[j])
+    #             assigned.add(j)
+
+    #     merged_clusters.append(np.sort(np.array(group)))
 
     return merged_clusters, sim, n_bad_channels
 
@@ -539,16 +719,82 @@ def cluster_spike_waveforms(
         selected_channels = np.argsort(ei_p2p)[-min_chan:]
     selected_channels = np.sort(selected_channels)
 
+    main_chan = np.argmax(ei_p2p)
+
     snips_sel = snips[selected_channels, :, :]
     C, T, N = snips_sel.shape
-    snips_centered = snips_sel - snips_sel.mean(axis=1, keepdims=True)
+    # snips_centered = snips_sel - snips_sel.mean(axis=1, keepdims=True) # commented out because baseline subtraction happens before this function and I don't like per-spike offsets
+    snips_centered = snips_sel.copy()
     snips_flat = snips_centered.transpose(2, 0, 1).reshape(N, -1)
 
-    pca = PCA(n_components=10)
-    pcs = pca.fit_transform(snips_flat)
+    # --- Focused PCA on main channel in spike zone ---
+    spike_zone = slice(10, 40)  # or whatever range captures the peak
 
+    main_snips = snips[main_chan, spike_zone, :].T  # shape: (N, T_spike)
+    main_pc1 = PCA(n_components=1).fit_transform(main_snips).flatten()
+
+    # --- Append to flattened snippets before clustering ---
+    pcs = PCA(n_components=10).fit_transform(snips_flat)
+
+    pcs_z = StandardScaler().fit_transform(pcs)
+    main_pc1_z = StandardScaler().fit_transform(main_pc1[:, None]).flatten()
+
+    pcs_aug = np.hstack((pcs_z, main_pc1_z[:, None]))
+    # pcs_aug = np.hstack((pcs, main_pc1[:, None]))
+
+    # --- Clustering
     kmeans = KMeans(n_clusters=k_start, n_init=10, random_state=42)
-    labels = kmeans.fit_predict(pcs)
+    labels = kmeans.fit_predict(pcs_aug)
+
+    labels_updated = labels.copy()
+    next_label = labels_updated.max() + 1
+
+    # Initialize list of clusters to check
+    to_check = list(np.unique(labels_updated))
+
+    while to_check:
+        cl = to_check.pop(0)
+        mask = labels_updated == cl
+        pc_vals = pcs_aug[mask, :2]
+
+        if len(pc_vals) < 20:
+            continue
+
+        split_result = check_2d_gap_peaks_valley(pc_vals, angle_step=10, min_valley_frac=0.25)
+
+        if split_result is not None:
+            group1_mask, group2_mask = split_result
+            cluster_indices = np.where(mask)[0]
+
+            n1 = np.sum(group1_mask)
+            n2 = np.sum(group2_mask)
+
+            if n1 < 20 or n2 < 20:
+                print(f"  Split discarded: would create small cluster (group1={n1}, group2={n2})")
+                continue
+
+            # Assign new label to group2 (or vice versa)
+            labels_updated[cluster_indices[group2_mask]] = next_label
+            print(f"  Cluster {cl} split into {cl} and {next_label}")
+
+            # Add both parts back to check if large enough
+            if np.sum(group1_mask) >= 20:
+                to_check.append(cl)
+            if np.sum(group2_mask) >= 20:
+                to_check.append(next_label)
+
+            next_label += 1
+
+    labels = labels_updated
+
+
+
+
+    # pca = PCA(n_components=10)
+    # pcs = pca.fit_transform(snips_flat)
+
+    # kmeans = KMeans(n_clusters=k_start, n_init=10, random_state=42)
+    # labels = kmeans.fit_predict(pcs)
 
     if plot_diagnostic == True:
         import matplotlib.pyplot as plt
@@ -566,7 +812,7 @@ def cluster_spike_waveforms(
         plt.show()
 
 
-    merged_clusters, sim, n_bad_channels = merge_similar_clusters(snips, labels, max_lag=3, p2p_thresh=30.0, amp_thresh=-20, cos_thresh=0.8)
+    merged_clusters, sim, n_bad_channels = merge_similar_clusters(snips, labels, max_lag=3, p2p_thresh=30.0, amp_thresh=-20, cos_thresh=0.75)
 
     # cluster_spike_indices = {k: np.where(labels == k)[0] for k in np.unique(labels)}
 
@@ -733,6 +979,7 @@ def ei_pursuit_ram(
         raw_data_override=raw_data  # This requires modification inside run_multi_gpu_ei_scan
     )
 
+    #print(selected_channels)
     # Adjust for alignment offset
     adjusted_selected_inds = spikes - alignment_offset
     adjusted_selected_inds = adjusted_selected_inds[
@@ -740,7 +987,7 @@ def ei_pursuit_ram(
     ]
 
     def fit_threshold(scores):
-        cutoff = np.percentile(scores, fit_percentile)
+        cutoff = np.percentile(scores, fit_percentile, method='nearest')
         left_tail = scores[scores <= cutoff]
         mu, sigma = norm.fit(left_tail)
         return mu - sigma_thresh * sigma
@@ -748,8 +995,39 @@ def ei_pursuit_ram(
     mean_scores = mean_score[adjusted_selected_inds]
     valid_scores = valid_score[adjusted_selected_inds]
 
-    mean_threshold = fit_threshold(mean_scores)
-    valid_threshold = fit_threshold(valid_scores)
+    clean_mean = mean_scores[~np.isnan(mean_scores)]
+    clean_valid = valid_scores[~np.isnan(valid_scores)]
+
+    mean_threshold = fit_threshold(clean_mean)
+    valid_threshold = fit_threshold(clean_valid)
+
+    import matplotlib.pyplot as plt
+
+    plt.figure(figsize=(10, 5))
+    plt.hist(mean_score, bins=200, alpha=0.5, label='All mean scores', color='gray')
+    plt.hist(mean_scores, bins=200, alpha=0.5, label='KS spike scores', color='red')
+    plt.axvline(mean_threshold, color='red', linestyle='--', label=f"Mean threshold = {mean_threshold:.2f}")
+    plt.xlabel("Mean EI Match Score")
+    plt.ylabel("Count")
+    plt.title("Mean EI Scores: Global vs. KS-aligned")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+
+    plt.figure(figsize=(10, 5))
+    plt.hist(valid_score, bins=200, alpha=0.5, label='All mean scores', color='gray')
+    plt.hist(valid_scores, bins=200, alpha=0.5, label='KS spike scores', color='red')
+    plt.axvline(valid_threshold, color='red', linestyle='--', label=f"Mean threshold = {mean_threshold:.2f}")
+    plt.xlabel("Mean EI Match Score")
+    plt.ylabel("Count")
+    plt.title("Mean EI Scores: Global vs. KS-aligned")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
 
     peaks = argrelextrema(mean_score, np.greater_equal, order=1)[0]
     valid_inds = peaks[
@@ -927,6 +1205,65 @@ def select_cluster_by_ei_similarity_ram(
     final_channels = clusters[group_cluster_indices[0]]['channels'] # assumed same across merged
 
     return final_ei, final_inds, final_channels, best_idx
+
+
+def check_2d_gap_peaks_valley(pc_vals, angle_step=10, min_valley_frac=0.1):
+    angles = np.deg2rad(np.arange(0, 180, angle_step))
+    n_total = len(pc_vals)
+
+    for theta in angles:
+        proj = pc_vals[:, 0] * np.cos(theta) + pc_vals[:, 1] * np.sin(theta)
+        n_bins = 10
+        hist, edges = np.histogram(proj, bins=n_bins)
+
+        # Find local maxima
+        peak_inds, _ = find_peaks(hist)
+
+        if len(peak_inds) < 2:
+            continue  # Only one peak, nothing to check
+
+        # Check valleys between pairs of peaks
+        for i in range(len(peak_inds)-1):
+            left_peak = peak_inds[i]
+            right_peak = peak_inds[i+1]
+            left_count = hist[left_peak]
+            right_count = hist[right_peak]
+            min_peak_count = min(left_count, right_count)
+
+            # Get bins between peaks
+            between = hist[left_peak+1 : right_peak]
+            if len(between) == 0:
+                continue
+
+            min_valley = np.min(between)
+
+            # Plot
+            # plt.figure(figsize=(3,2))
+            # plt.bar((edges[:-1] + edges[1:]) / 2, hist, width=(edges[1]-edges[0]))
+            # plt.title(f"Angle {np.rad2deg(theta):.1f} deg,  Min valley: {min_valley}, Peaks {left_count}, {right_count}")
+            # plt.show()
+
+            if min_valley <= min_valley_frac * min_peak_count:
+                # Determine valley bin edge
+                valley_bin_idx = np.where(between == min_valley)[0][0] + left_peak + 1
+                split_val = (edges[valley_bin_idx] + edges[valley_bin_idx + 1]) / 2
+
+                group1_mask = proj < split_val
+                group2_mask = proj >= split_val
+
+                # print(f"Gap found at angle {np.rad2deg(theta):.1f} deg")
+                # print(f"  Peaks at bins {left_peak}, {right_peak}: counts {left_count}, {right_count}")
+                # print(f"  Min valley: {min_valley}")
+                
+                # # Plot
+                # plt.figure(figsize=(3,2))
+                # plt.bar((edges[:-1] + edges[1:]) / 2, hist, width=(edges[1]-edges[0]))
+                # plt.title(f"Angle {np.rad2deg(theta):.1f} deg")
+                # plt.show()
+
+                return group1_mask, group2_mask
+            
+    return None
 
 
 
@@ -1183,6 +1520,8 @@ def plot_unit_diagnostics(
     labels_post: np.ndarray,
     sim_matrix_post: np.ndarray,
     spikes_for_plot_post: np.ndarray,
+    n_bad_channels_post: np.ndarray,
+    contributing_original_ids_post: np.ndarray,
     cluster_eis_post: np.ndarray,
     window: tuple,
     ei_positions: np.ndarray,
@@ -1389,7 +1728,7 @@ def plot_unit_diagnostics(
         ax=ei_row_pre
     )
 
-    ei_row_pre.set_title(f"Cluster EIs; clusters {contributing_original_ids_pre} meerged; total spikes {len(mean_scores_at_spikes)}")
+    ei_row_pre.set_title(f"Cluster EIs; clusters {contributing_original_ids_pre} merged; total spikes {len(mean_scores_at_spikes)}", fontsize=16)
 
     # for i in range(len(ei_clusters_pre)):
     #     ax = fig.add_subplot(ei_row_pre[i])
@@ -1531,16 +1870,37 @@ def plot_unit_diagnostics(
 
     ax5a = fig.add_subplot(gs[4, 1])
     ax5a.set_title("Similarity Matrix (Post)")
-    tb = Table(ax5a, bbox=[0.2, 0.2, 0.6, 0.6])
+
+    label_matrix = np.empty_like(sim_matrix_post, dtype=object)
     n = sim_matrix_post.shape[0]
     for i in range(n):
         for j in range(n):
-            tb.add_cell(i, j, 1/n, 1/n, text=f"{sim_matrix_post[i, j]:.2f}", loc='center')
+            score = sim_matrix_post[i, j]
+            n_bad = n_bad_channels_post[i, j]
+            label_matrix[i, j] = f"{score:.2f}/{n_bad}"
+
+
+    tb = Table(ax5a, bbox=[0.2, 0.2, 0.8, 0.8])
+    n = sim_matrix_post.shape[0]
+    for i in range(n):
+        for j in range(n):
+            tb.add_cell(i, j, 1/n, 1/n, text=label_matrix[i, j], loc='center')
     for i in range(n):
         tb.add_cell(i, -1, 1/n, 1/n, text=str(i), loc='right', edgecolor='none')
         tb.add_cell(-1, i, 1/n, 1/n, text=str(i), loc='center', edgecolor='none')
     ax5a.add_table(tb)
     ax5a.axis('off')
+
+    # tb = Table(ax5a, bbox=[0.2, 0.2, 0.6, 0.6])
+    # n = sim_matrix_post.shape[0]
+    # for i in range(n):
+    #     for j in range(n):
+    #         tb.add_cell(i, j, 1/n, 1/n, text=f"{sim_matrix_post[i, j]:.2f}", loc='center')
+    # for i in range(n):
+    #     tb.add_cell(i, -1, 1/n, 1/n, text=str(i), loc='right', edgecolor='none')
+    #     tb.add_cell(-1, i, 1/n, 1/n, text=str(i), loc='center', edgecolor='none')
+    # ax5a.add_table(tb)
+    # ax5a.axis('off')
 
 
     s0 = spikes_for_plot_post[labels_post == 0]
@@ -1622,7 +1982,7 @@ def plot_unit_diagnostics(
         ax=ei_row_post
     )
 
-    ei_row_post.set_title("Cluster EIs")
+    ei_row_post.set_title(f"Cluster EIs; clusters {contributing_original_ids_post} merged; total spikes {len(spikes)}", fontsize=16)
 
     # Row 7: Final unit firing, ISI, STA time course, STA frame
     ax7a = fig.add_subplot(gs[6, 0])
@@ -1719,4 +2079,373 @@ def plot_unit_diagnostics(
     plt.subplots_adjust(top=0.97, bottom=0.03, left=0.05, right=0.98, hspace=0.5, wspace=0.25)
     os.makedirs(output_path, exist_ok=True)
     fig.savefig(os.path.join(output_path, f"unit_{unit_id:03d}_diagnostics_ram.png"), dpi=150)
-    plt.close(fig)
+    # plt.close(fig)
+
+
+
+
+
+def plot_unit_diagnostics_single_cluster(
+    output_path: str,
+    unit_id: int,
+    pcs_pre: np.ndarray,
+    labels_pre: np.ndarray,
+    sim_matrix_pre: np.ndarray,
+    cluster_eis_pre: np.ndarray,
+    spikes_for_plot_pre: np.ndarray,
+    n_bad_channels_pre: np.ndarray,
+    contributing_original_ids_pre: np.ndarray,
+    lags: np.ndarray,
+    bad_spike_traces: np.ndarray,
+    bad_spike_traces_easy: np.ndarray,
+    pcs: np.ndarray,
+    outlier_inds_easy: np.ndarray,
+    outlier_inds: np.ndarray,
+    good_mean_trace: np.ndarray,
+    ref_channel: int,
+    final_ei: np.ndarray,
+    ei_positions: np.ndarray,
+    spikes: np.ndarray,
+    orig_threshold: float,
+    ks_matches: list
+):
+    
+    # --- STA generation ---
+    sta_depth = 30
+    sta_offset = 0
+    sta_chunk_size = 1000
+    sta_refresh = 2
+    fs = 20000  # sampling rate in Hz
+
+    triggers_mat_path='/Volumes/Lab/Users/alexth/axolotl/trigger_in_samples_201703151.mat'
+
+    triggers = loadmat(triggers_mat_path)['triggers'].flatten() # triggers in s
+
+    lut = np.array([
+        [255, 255, 255],
+        [255, 255,   0],
+        [255,   0, 255],
+        [255,   0,   0],
+        [0,   255, 255],
+        [0,   255,   0],
+        [0,     0, 255],
+        [0,     0,   0]
+    ], dtype=np.uint8).flatten()
+    
+    generator = RGBFrameGenerator('/Volumes/Lab/Users/alexth/axolotl/sta/libdraw_rgb.so')
+    generator.configure(width=20, height=40, lut=lut, noise_type=1, n_bits=3)
+
+    # --- FIGURE setup ---
+
+    fig = plt.figure(figsize=(16, 30))
+    gs = gridspec.GridSpec(6, 4, height_ratios=[0.7, 0.7, 2.0, 0.7, 2, 0.7], width_ratios=[1, 1, 1, 1], wspace=0.25)
+
+    # --- Row 1: PCA pre-merge and sim matrix ---
+    row1_gs = gridspec.GridSpecFromSubplotSpec(1, 5, subplot_spec=gs[0, :], wspace=0.05)
+
+    color_cycle = itertools.cycle(rcParams['axes.prop_cycle'].by_key()['color'])
+    cluster_colors = {}
+
+    ax1 = fig.add_subplot(row1_gs[0])
+    ax1.set_title("Initial PCA (pre-merge)")
+    for lbl in np.unique(labels_pre):
+        color = next(color_cycle)
+        cluster_colors[lbl] = color
+        pts = pcs_pre[labels_pre == lbl]
+        ax1.scatter(pts[:, 0], pts[:, 1], s=5, color=color, label=f"{len(pts)} sp")
+        # ax1.scatter(pts[:, 0], pts[:, 1], s=5, label=f"Cluster {lbl} (N={len(pts)})")
+    ax1.set_xlabel("PC1")
+    ax1.set_ylabel("PC2")
+    ax1.set_aspect('equal', adjustable='box')
+    ax1.grid(True)
+    # ax1.legend(
+    #     loc='upper center',
+    #     bbox_to_anchor=(1, -0.15),  # x=center, y=below the axis
+    #     ncol=len(np.unique(labels_pre)),  # spread horizontally
+    #     fontsize=14,
+    #     frameon=False
+    # )
+
+    # Extract cluster labels
+    cluster_ids_pre = sorted(np.unique(labels_pre))
+    # Get default matplotlib color cycle
+    default_colors = itertools.cycle(rcParams['axes.prop_cycle'].by_key()['color'])
+    # Build color list in order of cluster appearance
+    colors_pre = [next(default_colors) for _ in cluster_ids_pre]
+
+
+    ax2 = fig.add_subplot(row1_gs[1])
+    ax2.set_title("Similarity Matrix (Pre)")
+
+    label_matrix = np.empty_like(sim_matrix_pre, dtype=object)
+    n = sim_matrix_pre.shape[0]
+    for i in range(n):
+        for j in range(n):
+            score = sim_matrix_pre[i, j]
+            n_bad = n_bad_channels_pre[i, j]
+            label_matrix[i, j] = f"{score:.2f}/{n_bad}"
+
+
+    tb = Table(ax2, bbox=[0.2, 0.2, 0.8, 0.8])
+    n = sim_matrix_pre.shape[0]
+    for i in range(n):
+        for j in range(n):
+            tb.add_cell(i, j, 1/n, 1/n, text=label_matrix[i, j], loc='center')
+    for i in range(n):
+        tb.add_cell(i, -1, 1/n, 1/n, text=str(i), loc='right', edgecolor='none')
+        tb.add_cell(-1, i, 1/n, 1/n, text=str(i), loc='center', edgecolor='none')
+    ax2.add_table(tb)
+    ax2.axis('off')
+
+    # --- STA plotting loop ---
+    max_clusters_row1 = 3
+    max_clusters_row2 = 4
+
+    cluster_spike_lists = [spikes_for_plot_pre[labels_pre == i] for i in np.unique(labels_pre)]
+
+    # --- Row 1 and 2: STAs ---
+    for idx, sN in enumerate(cluster_spike_lists):
+        if len(sN) == 0 or sN[0] <= 0:
+            continue
+
+        # Select subplot position
+        if idx < max_clusters_row1:
+            ax = fig.add_subplot(row1_gs[idx+2])
+        elif idx < max_clusters_row1 + max_clusters_row2:
+            row2_idx = idx - max_clusters_row1
+            ax = fig.add_subplot(gs[1, row2_idx])
+        else:
+            print(f"Skipping cluster {idx}, no space for more plots")
+            continue
+
+        # Compute STA
+        sta = compute_sta_chunked(
+            spikes_sec=sN / fs,
+            triggers_sec=triggers,
+            generator=generator,
+            seed=11111,
+            depth=sta_depth,
+            offset=sta_offset,
+            chunk_size=sta_chunk_size,
+            refresh=sta_refresh
+        )
+
+        max_idx = np.unravel_index(np.abs(sta).argmax(), sta.shape)
+        peak_frame = max_idx[3]
+        if peak_frame > 7 or peak_frame < 3:
+            peak_frame = 4
+
+        rgb = sta[:, :, :, peak_frame]
+        vmax = np.max(np.abs(sta)) * 2
+        norm_rgb = rgb / vmax + 0.5
+        norm_rgb = np.clip(norm_rgb, 0, 1)
+
+        title_color = cluster_colors.get(idx, 'black')  # default to black if not found
+
+        ax.imshow(norm_rgb.transpose(1, 0, 2), origin='upper')
+        ax.set_title(f"Cluster {idx}. Frame {peak_frame + 1} (N={len(sN)})", fontsize=10, color=title_color)
+        ax.set_aspect('equal')
+        ax.axis('off')
+        ax.set_position(ax.get_position().expanded(1.1, 1.0))
+    
+    # --- Row 3: EI waveforms pre ---
+
+    #ei_row_pre = gridspec.GridSpecFromSubplotSpec(1, max(len(ei_clusters_pre), 2), subplot_spec=gs[1, :])
+    ei_row_pre = fig.add_subplot(gs[2, :])  # one full-width plot
+
+    plot_ei_waveforms(
+        ei=cluster_eis_pre,                 # list of EIs
+        positions=ei_positions,
+        ref_channel=ref_channel,
+        scale=70.0,
+        box_height=1.5,
+        box_width=50,
+        linewidth=1,
+        alpha=0.9,
+        colors=colors_pre,                 # same colors as PCA
+        ax=ei_row_pre
+    )
+    n_selected_spikes = np.sum(np.isin(labels_pre, contributing_original_ids_pre))
+
+    ei_row_pre.set_title(f"Cluster EIs; clusters {contributing_original_ids_pre} merged; {n_selected_spikes} spikes out of total {pcs_pre.shape[0]}", fontsize=16)
+
+    # --- Row 4: Bad spikes ---
+    row4_gs = gridspec.GridSpecFromSubplotSpec(1, 5, subplot_spec=gs[3, :])
+
+    ax4a = fig.add_subplot(row4_gs[0])       # Lags
+
+    ax4a.scatter(pcs[:, 0], pcs[:, 1], s=2, alpha=0.5)
+    ax4a.scatter(pcs[outlier_inds_easy, 0], pcs[outlier_inds_easy, 1], color='green', s=6, alpha=1)
+    ax4a.scatter(pcs[outlier_inds, 0], pcs[outlier_inds, 1], color='red', s=6, alpha=1)
+    ax4a.set_title("PCA on Ref Channel Waveforms")
+    ax4a.set_xlabel("PC1")
+    ax4a.set_ylabel("PC2")
+    ax4a.grid(True)
+
+
+    ax4b = fig.add_subplot(row4_gs[1:3])     # Bad spikes
+    if isinstance(bad_spike_traces_easy, np.ndarray) and bad_spike_traces_easy.shape[0] > 0:
+        for trace in bad_spike_traces_easy:
+            ax4b.plot(trace, color='green', alpha=1, linewidth=1)
+        if isinstance(bad_spike_traces, np.ndarray) and bad_spike_traces.shape[0] > 0:
+            for trace in bad_spike_traces:
+                ax4b.plot(trace, color='black', alpha=1, linewidth=1)
+    else:
+        ax4b.text(0.5, 0.5, 'No bad spikes', transform=ax4b.transAxes,
+                ha='center', va='center', fontsize=10, color='red')
+        ax4b.set_xticks([])
+        ax4b.set_yticks([])
+
+    ax4b.plot(good_mean_trace, color='red', linewidth=2, label='Good Mean')
+    ax4b.set_title(f"Ref Channel {ref_channel+1} | {len(bad_spike_traces)} bad spikes | orig threshold {-orig_threshold:.1f}")
+    ax4b.grid(True)
+
+    ax4b.legend(
+        loc='upper center',
+        bbox_to_anchor=(0.5, -0.15),  # x=center, y=below the axis
+        ncol=2,  # spread horizontally
+        fontsize=14,
+        frameon=False
+    )
+
+    ax4c = fig.add_subplot(row4_gs[3:5])     # KS matches
+    ax4c.axis('off')
+
+    if ks_matches:
+        table_data = [
+            ["KS Unit", "Vision ID", "Sim", "N spikes"]
+        ] + [
+            [m["unit_id"], m["vision_id"],f"{m['similarity']:.2f}", m["n_spikes"]] for m in ks_matches
+        ]
+
+        tb = ax4c.table(
+            cellText=table_data[1:],
+            colLabels=table_data[0],
+            loc='center',
+            cellLoc='center',
+            bbox=[0.3, 0.0, 0.7, 1.0] 
+        )
+        tb.scale(0.6, 1)
+        for i in range(len(ks_matches) + 1):
+            for j in range(4):
+                tb[(i, j)].set_fontsize(14)
+    else:
+        ax4c.text(0.5, 0.5, 'No match', transform=ax4c.transAxes,
+                       ha='center', va='center', fontsize=14, color='gray')
+    
+    ax4c.set_title("Matching KS Units")
+
+    # --- Row 5: Final EI waveforms ---
+
+    ei_row_final = fig.add_subplot(gs[4, :])  # one full-width plot
+    plot_ei_waveforms(
+        ei=final_ei,                 # list of EIs
+        positions=ei_positions,
+        ref_channel=ref_channel,
+        scale=70.0,
+        box_height=1.5,
+        box_width=50,
+        linewidth=1,
+        alpha=0.9,
+        colors=colors_pre,                 # same colors as PCA
+        ax=ei_row_final
+    )
+
+    ei_row_final.set_title(f"Final EI; total spikes {len(spikes)}", fontsize=16)
+
+    # Row 6: Final unit firing, ISI, STA time course, STA frame
+    ax7a = fig.add_subplot(gs[5, 0])
+    ax7b = fig.add_subplot(gs[5, 1])
+    ax7c = fig.add_subplot(gs[5, 2])
+    ax7d = fig.add_subplot(gs[5, 3])
+
+    fs = 20000  # sampling rate in Hz
+    times_sec = np.sort(spikes) / fs # spikes in seconds
+
+    # --- Firing rate plot (smoothed) ---
+    if len(times_sec) > 0:
+        sigma_ms=2500.0
+        dt_ms=1000.0
+        dt = dt_ms / 1000.0
+        sigma_samples = sigma_ms / dt_ms
+        total_duration = 1800.1
+        time_vector = np.arange(0, total_duration, dt)
+        counts, _ = np.histogram(times_sec, bins=np.append(time_vector, total_duration))
+        rate = gaussian_filter1d(counts / dt, sigma=sigma_samples)
+        ax7a.plot(time_vector, rate, color='black')
+        ax7a.set_title(f"Smoothed Firing Rate, {len(spikes)} spikes")
+        ax7a.set_xlabel("Time (s)")
+        ax7a.set_ylabel("Rate (Hz)")
+    else:
+        ax7a.text(0.5, 0.5, 'No spikes', transform=ax7a.transAxes,
+                 ha='center', va='center', fontsize=10, color='red')
+        ax7a.set_xticks([])
+        ax7a.set_yticks([])
+
+
+    # --- ISI histogram ---
+
+    if len(times_sec) > 1:
+        isi = np.diff(times_sec) # differences in seconds
+        isi_max_s = 200.0 / 1000.0  # convert to seconds
+        bins = np.arange(0, isi_max_s + 0.0005, 0.0005)
+        hist, _ = np.histogram(isi, bins=bins)
+        fractions = hist / hist.sum() if hist.sum() > 0 else np.zeros_like(hist)
+        bin_centers = (bins[:-1] + bins[1:]) / 2
+        ax7b.plot(bin_centers, fractions, color='blue')
+        ax7b.set_xlim(0, isi_max_s)
+        ax7b.set_ylim(0, np.max(fractions) * 1.1)
+        ax7b.set_title("ISI Histogram", fontsize=10)
+        ax7b.set_xlabel("ISI (ms)")
+    else:
+        ax7b.text(0.5, 0.5, 'No ISIs', transform=ax7b.transAxes,
+            ha='center', va='center', fontsize=10, color='red')
+        ax7b.set_xticks([])
+        ax7b.set_yticks([])
+
+
+    if len(times_sec) > 0 and times_sec[0]>0:
+        sta = compute_sta_chunked(
+            spikes_sec=times_sec,
+            triggers_sec=triggers,
+            generator=generator,
+            seed=11111,
+            depth=sta_depth,
+            offset=sta_offset,
+            chunk_size=sta_chunk_size,
+            refresh=sta_refresh
+        )
+        # Time course from peak pixel
+        max_idx = np.unravel_index(np.abs(sta).argmax(), sta.shape)
+        y, x = max_idx[0], max_idx[1]
+        red_tc = sta[y, x, 0, :][::-1]
+        green_tc = sta[y, x, 1, :][::-1]
+        blue_tc = sta[y, x, 2, :][::-1]
+
+        ax7c.plot(red_tc, color='red', label='R')
+        ax7c.plot(green_tc, color='green', label='G')
+        ax7c.plot(blue_tc, color='blue', label='B')
+        ax7c.set_title("STA Time Course", fontsize=10)
+        ax7c.set_xlim(0, sta_depth - 1)
+        ax7c.set_xticks([0, sta_depth - 1])
+        ax7c.set_xlabel("Time (frames)")
+
+        # Display STA frame at peak time
+        peak_frame = max_idx[3]
+        if peak_frame>7 or peak_frame<3:
+            peak_frame = 4
+        rgb = sta[:, :, :, peak_frame]
+        vmax = np.max(np.abs(sta)) * 2
+        norm_rgb = rgb / vmax + 0.5
+        norm_rgb = np.clip(norm_rgb, 0, 1)
+
+        ax7d.imshow(norm_rgb.transpose(1, 0, 2), origin='upper')
+        ax7d.set_title(f"STA Frame {peak_frame + 1}", fontsize=10)
+        ax7d.set_aspect('equal')
+        ax7d.axis('off')
+    
+
+    plt.subplots_adjust(top=0.97, bottom=0.03, left=0.05, right=0.98, hspace=0.5, wspace=0.25)
+    os.makedirs(output_path, exist_ok=True)
+    fig.savefig(os.path.join(output_path, f"unit_{unit_id:03d}_diagnostics_ram.png"), dpi=150)
+    # plt.close(fig)
