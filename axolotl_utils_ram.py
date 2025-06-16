@@ -28,6 +28,61 @@ from matplotlib import rcParams
 import itertools
 from scipy.stats import trim_mean
 from sklearn.preprocessing import StandardScaler
+from sklearn.mixture import GaussianMixture
+
+from scipy.stats import gaussian_kde
+
+def silverman_test(data, num_bootstrap=500, random_state=None):
+    """
+    Silverman's test for unimodality.
+    
+    Parameters:
+        data : array-like, 1D
+            The data to test for unimodality.
+        num_bootstrap : int
+            Number of bootstrap samples.
+        random_state : int or None
+            Seed for reproducibility.
+    
+    Returns:
+        p_value : float
+            P-value for the null hypothesis (unimodal distribution).
+    """
+    rng = np.random.default_rng(random_state)
+    data = np.asarray(data)
+    n = len(data)
+
+    # Step 1: Compute h_obs (smallest bandwidth for unimodal KDE)
+    def min_unimodal_bandwidth(data):
+        # Start with Silverman's rule of thumb
+        std_dev = np.std(data, ddof=1)
+        iqr = np.subtract(*np.percentile(data, [75, 25]))
+        sigma = min(std_dev, iqr / 1.349)
+        h0 = 0.9 * sigma * n ** (-1/5)
+
+        # Search for min bandwidth producing unimodal KDE
+        hs = np.linspace(h0 * 0.1, h0 * 2, 20)
+        for h in hs:
+            kde = gaussian_kde(data, bw_method=h / data.std(ddof=1))
+            x_grid = np.linspace(data.min(), data.max(), 1000)
+            y = kde.evaluate(x_grid)
+            modes = np.sum((y[1:-1] > y[:-2]) & (y[1:-1] > y[2:]))
+            if modes <= 1:
+                return h
+        return hs[-1]
+
+    h_obs = min_unimodal_bandwidth(data)
+
+    # Step 2: Bootstrap
+    count = 0
+    for _ in range(num_bootstrap):
+        resample = rng.choice(data, size=n, replace=True)
+        h_boot = min_unimodal_bandwidth(resample)
+        if h_boot >= h_obs:
+            count += 1
+
+    p_value = count / num_bootstrap
+    return p_value
 
 def compute_baselines_int16(raw_data, segment_len=100_000):
     """
@@ -102,86 +157,91 @@ def compute_baselines_int16_deriv_robust(raw_data, segment_len=100_000, diff_thr
     return baselines
 
 
-
 def find_dominant_channel_ram(
     raw_data: np.ndarray,
+    positions: np.ndarray,                  # [C,2] electrode x-y (µm)
     segment_len: int = 100_000,
     n_segments: int = 10,
     peak_window: int = 30,
     top_k_neg: int = 20,
     top_k_events: int = 5,
     seed: int = 42,
-    use_negative_peak: bool = False
-) -> list:
+    use_negative_peak: bool = False,
+    top_n: int = 10,                        # how many channels to return
+    min_spacing: float = 150.0              # min µm separation
+) -> tuple[list[int], list[float]]:
     """
-    Identify the dominant channels based on spike-like events.
+    Pick up to `top_n` channels with the largest spike-like amplitudes that are
+    at least `min_spacing` µm apart.
 
-    Parameters:
-        raw_data: ndarray of shape [T, C]
-        segment_len: number of samples per segment
-        n_segments: how many segments to check
-        peak_window: half-width for spike amplitude window
-        top_k_neg: number of negative peaks to keep per channel per segment
-        top_k_events: number of top amplitudes to average per channel
-        seed: RNG seed
-        use_negative_peak: if True, use negative peak value only as score (more negative = stronger)
-                           if False, use peak-to-peak amplitude
-
-    Returns:
-        List of indices of top channels
+    Returns
+    -------
+    top_channels   : list[int]   indices of selected electrodes
+    top_amplitudes : list[float] score for each returned channel
     """
+
     total_samples, n_channels = raw_data.shape
     rng = np.random.default_rng(seed)
 
-    # Always include one deterministic first segment
-    first_segment_start = rng.integers(0, min(100_000, total_samples - segment_len))
+    # deterministic + random segment starts
+    first_start = rng.integers(0, min(100_000, total_samples - segment_len))
     other_starts = rng.integers(0, total_samples - segment_len, size=n_segments - 1)
-    start_indices = np.concatenate([[first_segment_start], other_starts])
+    starts = np.concatenate([[first_start], other_starts])
 
-    # Store candidate amplitudes per channel
-    channel_amplitudes = [[] for _ in range(n_channels)]
+    channel_amps = [[] for _ in range(n_channels)]
 
-    for start in start_indices:
-        segment = raw_data[start:start + segment_len, :]
-
+    for start in starts:
+        seg = raw_data[start:start + segment_len, :]
         for ch in range(n_channels):
-            trace = segment[:, ch]
-            trace_centered = trace - np.mean(trace)
+            trace = seg[:, ch].astype(np.float32)
+            trace -= trace.mean()
 
-            neg_peaks, _ = find_peaks(-trace_centered, distance=20)
-            if len(neg_peaks) == 0:
+            neg_peaks, _ = find_peaks(-trace, distance=20)
+            if neg_peaks.size == 0:
                 continue
 
-            sorted_idx = np.argsort(trace_centered[neg_peaks])
-            selected_peaks = neg_peaks[sorted_idx[:top_k_neg]]
+            strongest = neg_peaks[np.argsort(trace[neg_peaks])[:top_k_neg]]
 
-            for peak_idx in selected_peaks:
-
-                valley = trace_centered[peak_idx].astype(np.float32)
-
+            for p in strongest:
+                valley = trace[p]
                 if use_negative_peak:
-                    amplitude = -valley  # more negative valley → higher score
+                    amp = -valley                                   # bigger = stronger
                 else:
-                    win_start = max(peak_idx - peak_window, 0)
-                    win_end = min(peak_idx + peak_window + 1, segment_len)
+                    w0, w1 = max(0, p - peak_window), min(segment_len, p + peak_window + 1)
+                    local_max = trace[w0:w1].max()
+                    amp = local_max - valley                        # peak-to-peak
+                channel_amps[ch].append(amp)
 
-                    local_window = trace_centered[win_start:win_end].astype(np.float32)
-                    local_max = np.max(local_window)
-                    amplitude = local_max - valley  # peak-to-peak
-
-                channel_amplitudes[ch].append(amplitude)
-
-    # Score: mean of top_k_events per channel
-    mean_amplitudes = np.zeros(n_channels, dtype=np.float32)
+    # mean of top-k events per channel
+    mean_amp = np.zeros(n_channels, dtype=np.float32)
     for ch in range(n_channels):
-        amps = np.array(channel_amplitudes[ch], dtype=np.float32)
-        if len(amps) > 0:
-            mean_amplitudes[ch] = np.mean(np.sort(amps)[-top_k_events:])
+        amps = np.asarray(channel_amps[ch], dtype=np.float32)
+        if amps.size:
+            mean_amp[ch] = amps[np.argsort(amps)][-top_k_events:].mean()
 
-    sorted_indices = np.argsort(mean_amplitudes)[::-1]
-    top_channels = sorted_indices[:10].tolist()
+    # ----------------------------------------------------------------
+    # spacing-aware greedy selection
+    # ----------------------------------------------------------------
+    sorted_idx = np.argsort(mean_amp)[::-1]       # high → low
+    selected   = []
+    for idx in sorted_idx:
+        if len(selected) >= top_n:
+            break
+        if all(np.linalg.norm(positions[idx] - positions[s]) >= min_spacing
+               for s in selected):
+            selected.append(idx)
 
-    return top_channels
+    # if not enough well-spaced channels, pad with next best
+    for idx in sorted_idx:
+        if len(selected) == top_n:
+            break
+        if idx not in selected:
+            selected.append(idx)
+
+    top_channels   = selected
+    top_amplitudes = mean_amp[top_channels].tolist()
+
+    return top_channels, top_amplitudes
 
 
 
@@ -638,11 +698,13 @@ def merge_similar_clusters(snips, labels, max_lag=3, p2p_thresh=30.0, amp_thresh
                     n_bad = n_bad_channels[existing, j]
 
                     accept = False
-                    if sim_ij >= 0.95 and n_bad <= 6:
+                    if sim_ij >= 0.95 and n_bad <= 7:
                         accept = True
-                    elif sim_ij >= 0.85 and n_bad <= 4:
+                    elif sim_ij >= 0.80 and n_bad <= 5:
                         accept = True
-                    elif sim_ij >= cos_thresh and n_bad == 2:
+                    elif sim_ij >= 0.70 and n_bad == 3:
+                        accept = True
+                    elif sim_ij >= cos_thresh and n_bad == 1:
                         accept = True
 
                     if accept:
@@ -770,7 +832,7 @@ def cluster_spike_waveforms(
             n2 = np.sum(group2_mask)
 
             if n1 < 20 or n2 < 20:
-                print(f"  Split discarded: would create small cluster (group1={n1}, group2={n2})")
+                print(f"  Cluster {cl} split discarded: would create small cluster (group1={n1}, group2={n2})")
                 continue
 
             # Assign new label to group2 (or vice versa)
@@ -812,7 +874,7 @@ def cluster_spike_waveforms(
         plt.show()
 
 
-    merged_clusters, sim, n_bad_channels = merge_similar_clusters(snips, labels, max_lag=3, p2p_thresh=30.0, amp_thresh=-20, cos_thresh=0.75)
+    merged_clusters, sim, n_bad_channels = merge_similar_clusters(snips, labels, max_lag=3, p2p_thresh=30.0, amp_thresh=-20, cos_thresh=0.65)
 
     # cluster_spike_indices = {k: np.where(labels == k)[0] for k in np.unique(labels)}
 
@@ -2448,4 +2510,4 @@ def plot_unit_diagnostics_single_cluster(
     plt.subplots_adjust(top=0.97, bottom=0.03, left=0.05, right=0.98, hspace=0.5, wspace=0.25)
     os.makedirs(output_path, exist_ok=True)
     fig.savefig(os.path.join(output_path, f"unit_{unit_id:03d}_diagnostics_ram.png"), dpi=150)
-    # plt.close(fig)
+    plt.close(fig)
