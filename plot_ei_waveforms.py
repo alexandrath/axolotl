@@ -1,10 +1,12 @@
-# Re-import after code state reset
+
 import numpy as np
 import matplotlib.pyplot as plt
 
 def plot_ei_waveforms(ei, positions, ref_channel=None, scale=1.0, ax=None,
                       colors='black', alpha=1.0, linewidth=0.5,
-                      box_height=1.0, box_width=1.0):
+                      box_height=1.0, box_width=1.0, aspect=1.0,
+                      min_global_max=None):
+
     """
     Plot one or more EI waveforms overlaid at their spatial locations.
 
@@ -19,10 +21,14 @@ def plot_ei_waveforms(ei, positions, ref_channel=None, scale=1.0, ax=None,
     - linewidth: width of waveform trace
     - box_height: vertical size of virtual box hosting the waveform
     - box_width: horizontal width of waveform (same for all electrodes)
+    - min_global_max: optional float. Floor (in ADC counts) for the global abs max used
+  to normalize all inputs. If None, use the observed max. Example: 100 means
+  “pretend there exists a sample with |value| = 100 unless a larger real value exists.”
+
     """
 
     ax = ax or plt.gca()
-    ax.set_aspect('equal')
+    ax.set_aspect(aspect)
     ax.axis('off')
 
     # Handle single EI case by wrapping it in a list
@@ -33,15 +39,21 @@ def plot_ei_waveforms(ei, positions, ref_channel=None, scale=1.0, ax=None,
 
     if isinstance(colors, str):
         colors = [colors] * len(eis)
+    if not isinstance(alpha, (list, np.ndarray)):
+        alpha = [alpha] * len(eis)
+    if not isinstance(linewidth, (list, np.ndarray)):
+        linewidth = [linewidth] * len(eis)
 
-    # Normalize all EIs by the max amplitude across all
-    global_max = max(np.max(np.abs(e)) for e in eis)
-    if global_max == 0:
+    # Normalize all EIs by the max absolute amplitude across all,
+    # but enforce a floor if min_global_max is provided.
+    observed_max = max(np.max(np.abs(e)) for e in eis)
+    global_max = observed_max if (min_global_max is None) else max(observed_max, float(min_global_max))
+    if global_max <= 0:
         return
 
     t = np.linspace(-0.5, 0.5, eis[0].shape[1]) * box_width
 
-    for ei_array, color in zip(eis, colors):
+    for ei_array, color, this_alpha_global, this_lw_global in zip(eis, colors, alpha, linewidth):
         norm_ei = (ei_array / global_max) * scale * box_height
         # Compute normalized P2P amplitudes per channel
         p2ps = norm_ei.max(axis=1) - norm_ei.min(axis=1)
@@ -55,11 +67,11 @@ def plot_ei_waveforms(ei, positions, ref_channel=None, scale=1.0, ax=None,
                 this_alpha = 0.4
                 this_lw = 0.4
             else:
-                this_alpha = alpha
-                this_lw = linewidth
-            if isinstance(ref_channel, int) and i == ref_channel:
+                this_alpha = this_alpha_global
+                this_lw = this_lw_global
+            if ref_channel is not None and int(i) == int(ref_channel):
                 this_alpha = 1
-                this_lw = linewidth*2
+                this_lw = this_lw*3
 
             ax.plot(t + x_offset, y + y_offset, color=color, alpha=this_alpha, linewidth=this_lw)
 
@@ -72,4 +84,3 @@ def plot_ei_waveforms(ei, positions, ref_channel=None, scale=1.0, ax=None,
     ax.set_ylim(min_y - pad_y - extra_y_pad, max_y + pad_y + extra_y_pad)
 
     ax.set_xlim(min_x - pad_x, max_x + pad_x)
-    #ax.set_ylim(min_y - pad_y, max_y + pad_y)

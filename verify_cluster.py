@@ -74,7 +74,7 @@ def verify_cluster(spike_times, dat_path, params):
 
     while cluster_pool:
 
-        #print(f"[verify_cluster] {len(final_clusters)} finalized, {len(cluster_pool)} pending")
+        # print(f"[verify_cluster] {len(final_clusters)} finalized, {len(cluster_pool)} pending")
         cl = cluster_pool.pop(0)
         inds = cl['inds']
         depth = cl['depth']
@@ -102,6 +102,7 @@ def verify_cluster(spike_times, dat_path, params):
 
         snips_centered = snips_sel - snips_sel.mean(axis=1, keepdims=True)
         flat = snips_centered.transpose(2, 0, 1).reshape(len(inds), -1)
+        # print(len(inds))
         pcs = PCA(n_components=10).fit_transform(flat)
         labels = KMeans(n_clusters=k, n_init=10, random_state=42).fit_predict(pcs)
 
@@ -118,7 +119,7 @@ def verify_cluster(spike_times, dat_path, params):
                     'ei': ei_i,
                 })
 
-        #print(f"  KMeans produced {len(subclusters)} subclusters")
+        # print(f"  KMeans produced {len(subclusters)} subclusters")
 
         if len(subclusters) <= 1:
             #print("  Only one subcluster — finalizing as-is")
@@ -130,7 +131,7 @@ def verify_cluster(spike_times, dat_path, params):
             continue
 
         large_subclusters = [(i, cl) for i, cl in enumerate(subclusters) if len(cl['inds']) >= min_spikes]
-        #print(f"  {len(large_subclusters)} subclusters ≥ {min_spikes} spikes")
+        # print(f"  {len(large_subclusters)} subclusters ≥ {min_spikes} spikes")
 
         if len(large_subclusters) == 1:
             #print("  Only one large cluster — finalizing.")
@@ -144,7 +145,7 @@ def verify_cluster(spike_times, dat_path, params):
         if len(large_subclusters) > 1:
             eis_large = [cl['ei'] for _, cl in large_subclusters]
             sim_large = compare_eis(eis_large, None)
-            #print("  Pairwise similarity (large clusters):\n", np.round(sim_large, 3))
+            # print("  Pairwise similarity (large clusters):\n", np.round(sim_large, 3))
             merge_groups = find_merge_groups(sim_large, ei_sim_threshold)
             #print(f"  Found {len(merge_groups)} merge groups")
             if len(merge_groups) == 1:
@@ -157,11 +158,24 @@ def verify_cluster(spike_times, dat_path, params):
                 continue
 
         eis = [cl['ei'] for _, cl in large_subclusters]
+        # print(len(eis))
+
+        # if len(eis) == 0:
+        #     return []
+
+        if len(eis) == 0:
+            final_clusters.append({
+                'inds': inds,
+                'ei': ei,
+                'channels': selected
+            })
+            continue
+
         sim = compare_eis(eis, None)
         #print("  Similarity matrix (all large clusters):\n", np.round(sim, 3))
 
         groups = find_merge_groups(sim, ei_sim_threshold)
-        #print(f"  {len(groups)} merge groups will be processed")
+        # print(f"  {len(groups)} merge groups will be processed")
 
         if len(groups) == 0:
             #print("  No valid subclusters after merge — keeping current cluster.")
@@ -184,8 +198,9 @@ def verify_cluster(spike_times, dat_path, params):
             #else:
                 #print("    Discarding — too small")
 
+    # print(len(final_clusters))
     if len(final_clusters) == 1:
-        #print("  Only one final cluster — skipping deduplication.")
+        # print("  Only one final cluster — skipping deduplication.")
         return final_clusters
 
     all_final_eis = [compute_ei(snips[:, :, cl['inds']]) for cl in final_clusters]
@@ -209,7 +224,7 @@ def verify_cluster(spike_times, dat_path, params):
     all_eis = [cl['ei'] for cl in kept]
     sim = compare_eis(all_eis, None)
 
-    print("Final EI similarity matrix:\n", np.round(sim, 2))
+    # print("Final EI similarity matrix:\n", np.round(sim, 2))
 
-    print(f"[verify_cluster] Merged down to {len(kept)} final clusters.")
+    # print(f"[verify_cluster] Merged down to {len(kept)} final clusters.")
     return kept

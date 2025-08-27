@@ -29,87 +29,11 @@ import itertools
 from scipy.stats import trim_mean
 from sklearn.preprocessing import StandardScaler
 from sklearn.mixture import GaussianMixture
+from scipy.signal import correlate
 
 from scipy.stats import gaussian_kde
 import h5py
 from scipy.optimize import nnls
-
-def silverman_test(data, num_bootstrap=500, random_state=None):
-    """
-    Silverman's test for unimodality.
-    
-    Parameters:
-        data : array-like, 1D
-            The data to test for unimodality.
-        num_bootstrap : int
-            Number of bootstrap samples.
-        random_state : int or None
-            Seed for reproducibility.
-    
-    Returns:
-        p_value : float
-            P-value for the null hypothesis (unimodal distribution).
-    """
-    rng = np.random.default_rng(random_state)
-    data = np.asarray(data)
-    n = len(data)
-
-    # Step 1: Compute h_obs (smallest bandwidth for unimodal KDE)
-    def min_unimodal_bandwidth(data):
-        # Start with Silverman's rule of thumb
-        std_dev = np.std(data, ddof=1)
-        iqr = np.subtract(*np.percentile(data, [75, 25]))
-        sigma = min(std_dev, iqr / 1.349)
-        h0 = 0.9 * sigma * n ** (-1/5)
-
-        # Search for min bandwidth producing unimodal KDE
-        hs = np.linspace(h0 * 0.1, h0 * 2, 20)
-        for h in hs:
-            kde = gaussian_kde(data, bw_method=h / data.std(ddof=1))
-            x_grid = np.linspace(data.min(), data.max(), 1000)
-            y = kde.evaluate(x_grid)
-            modes = np.sum((y[1:-1] > y[:-2]) & (y[1:-1] > y[2:]))
-            if modes <= 1:
-                return h
-        return hs[-1]
-
-    h_obs = min_unimodal_bandwidth(data)
-
-    # Step 2: Bootstrap
-    count = 0
-    for _ in range(num_bootstrap):
-        resample = rng.choice(data, size=n, replace=True)
-        h_boot = min_unimodal_bandwidth(resample)
-        if h_boot >= h_obs:
-            count += 1
-
-    p_value = count / num_bootstrap
-    return p_value
-
-def compute_baselines_int16(raw_data, segment_len=100_000):
-    """
-    Compute mean baseline per channel over non-overlapping segments.
-    No artifact suppression. Operates directly on int16 data.
-    
-    Input:
-    - raw_data: [T, C], int16
-    - segment_len: samples per segment (default 100,000)
-
-    Output:
-    - baselines: [C, n_segments] float32
-    """
-    total_samples, n_channels = raw_data.shape
-    n_segments = (total_samples + segment_len - 1) // segment_len
-
-    baselines = np.zeros((n_channels, n_segments), dtype=np.float32)
-
-    for seg_idx in range(n_segments):
-        start = seg_idx * segment_len
-        end = min(start + segment_len, total_samples)
-        segment = raw_data[start:end, :]  # [segment_len, C]
-        baselines[:, seg_idx] = segment.mean(axis=0)
-
-    return baselines
 
 
 def compute_baselines_int16_deriv_robust(raw_data, segment_len=100_000, diff_thresh=50, trim_fraction=0.05):
@@ -193,7 +117,25 @@ def subtract_segment_baselines_int16(raw_data: np.ndarray,
 
     # done – raw_data now baseline-subtracted, still int16
 
+def plot_array(ei_positions):
+    plt.figure(figsize=(12,4))
 
+    for i in range(ei_positions.shape[0]):
+        x_pos = ei_positions[i, 0]
+        y_pos = ei_positions[i, 1]
+        plt.text(x_pos, y_pos, str(i), fontsize=8, ha='center', va='center')
+
+    plt.xlabel('X')
+    plt.ylabel('Y')
+    plt.title('EI positions with channel IDs')
+    plt.grid(True)
+
+    # Safe axis limits to prevent auto-scaling to something weird
+    plt.xlim(-1000, 1000)
+    plt.ylim(-500, 500)
+
+    plt.tight_layout()
+    plt.show()
 
 def find_dominant_channel_ram(
     raw_data: np.ndarray,
@@ -286,97 +228,66 @@ def find_dominant_channel_ram(
 def estimate_spike_threshold_ram(
     raw_data: np.ndarray,
     ref_channel: int,
-    window: int = 30,                       # API-holdover
     total_samples_to_read: int = 10_000_000,
     refractory: int = 30,
-    top_n: int = 100,                       # unused for now
-    threshold_scale: float = 0.5            # unused for now
-) -> tuple[float, np.ndarray]:
+) -> tuple[float, np.ndarray, np.ndarray]:
     """
-    Single-channel threshold estimation + spike extraction.
-
-    Valley-march rule
-    -----------------
-    • Start at the first valley left of the tallest histogram peak (noise).
-    • Accept that valley if
-          (depth_ok  AND  spikes_left >= 200)   OR   (spikes_left >= 50 000)
-      where depth_ok ≡  valley_count < 0.25 × min(neighbouring peaks).
-    • Otherwise move one valley toward the noise peak and repeat.
-    • If nothing qualifies, fall back to the 5 000-th most-negative peak.
+    Returns:
+        threshold : float
+        spikes : array of int, selected spike times passing threshold
+        next_spikes : array of int, top 500 largest peaks that were excluded
     """
 
-    # ------------------------------------------------------------
-    # 0.  Local DC removal (1-s chunks)
-    # ------------------------------------------------------------
     trace_f = raw_data[:total_samples_to_read, ref_channel].astype(np.float32)
-    # seg_len = 20_000                        # 1 s @ 20 kHz
-    # n_seg   = len(trace) // seg_len
 
-    # trace_f = np.empty_like(trace)
-    # for i in range(n_seg):
-    #     a, b = i * seg_len, (i + 1) * seg_len
-    #     seg = trace[a:b]
-    #     trace_f[a:b] = seg - seg.mean()
-
-    # ------------------------------------------------------------
-    # 1.  Collect negative peaks
-    # ------------------------------------------------------------
+    # -- Step 1: Collect negative peaks --
     neg_peaks, _ = find_peaks(-trace_f, distance=2 * refractory)
     if not len(neg_peaks):
-        return 0.0, np.empty(0, dtype=int)
+        return 0.0, np.empty(0, dtype=int), np.empty(0, dtype=int)
 
-    peak_vals = trace_f[neg_peaks]          # negative values
+    peak_vals = trace_f[neg_peaks]  # negative values
     hist, edges = np.histogram(peak_vals, bins=100)
     centers = (edges[:-1] + edges[1:]) / 2
 
-    peak_idx, _   = find_peaks(hist)
+    peak_idx, _ = find_peaks(hist)
     valley_idx, _ = find_peaks(-hist)
 
-    # ------------------------------------------------------------
-    # 2.  Adaptive valley search
-    # ------------------------------------------------------------
-    DEPTH_RATIO   = 0.25
-    NEED_200      = 200
-    NEED_50K      = 50_000
-    threshold     = None
+    # -- Step 2: Valley search --
+    DEPTH_RATIO = 0.25
+    NEED_200 = 200
+    NEED_50K = 20_000
+    threshold = None
 
     if len(peak_idx):
         noise_peak = peak_idx[np.argmax(hist[peak_idx])]
         cand_valleys = valley_idx[valley_idx < noise_peak]
 
-        for v in cand_valleys:                           # march rightwards
-            left_peaks  = peak_idx[peak_idx < v]
+        for v in cand_valleys:
+            left_peaks = peak_idx[peak_idx < v]
             right_peaks = peak_idx[peak_idx > v]
             if not len(left_peaks):
                 continue
 
-            left_cnt  = hist[left_peaks[-1]]
+            left_cnt = hist[left_peaks[-1]]
             right_cnt = hist[right_peaks[0]] if len(right_peaks) else left_cnt
             valley_ok = hist[v] < DEPTH_RATIO * left_cnt
 
             spikes_left = hist[:v].sum()
-            # print(f"v={v}  valley={hist[v]}  left={left_cnt}  right={right_cnt}  spikes_left={spikes_left}")
-
             if (valley_ok and spikes_left >= NEED_200) or (spikes_left >= NEED_50K):
                 threshold = centers[v]
                 break
-    
-    # ------------------------------------------------------------
-    # 3.  Fallback – 5 000-th most-negative peak
-    # ------------------------------------------------------------
+
+    # -- Step 3: Fallback threshold --
     if threshold is None:
-        amps_sorted = np.sort(peak_vals)                 # ascending
+        amps_sorted = np.sort(peak_vals)
         k = 4_999
         threshold = amps_sorted[k] if len(amps_sorted) > k else amps_sorted[-1]
 
-    # ------------------------------------------------------------
-    # 4.  Threshold-crossing windows  (correct sign)
-    # ------------------------------------------------------------
-    below = trace_f < threshold                          # negative crossings
-    down  = np.where(~below[:-1] &  below[1:])[0] + 1    # entry
-    up    = np.where( below[:-1] & ~below[1:])[0] + 1    # exit
+    # -- Step 4: Threshold-crossing --
+    below = trace_f < threshold
+    down = np.where(~below[:-1] & below[1:])[0] + 1
+    up = np.where(below[:-1] & ~below[1:])[0] + 1
 
-    # pair entries/exits
     i = j = 0
     windows = []
     while i < len(down) and j < len(up):
@@ -392,10 +303,14 @@ def estimate_spike_threshold_ram(
     # ------------------------------------------------------------
     spikes = []
     last = -np.inf
+    all_spike_candidates = []
+
     for a, b in windows:
         if b - a < 1:
             continue
         idx = np.argmin(trace_f[a:b]) + a
+        amp = -trace_f[idx]
+        all_spike_candidates.append((amp, idx))
         if idx - last > refractory:
             spikes.append(idx)
             last = idx
@@ -410,6 +325,21 @@ def estimate_spike_threshold_ram(
         amps = -trace_f[spikes]
         keep = np.argsort(amps)[-MAX_SPIKES:]
         spikes = np.sort(spikes[keep])
+
+    # -- Step 7: sub-threshold peaks ------------------------------------
+    # NB: threshold is still NEGATIVE at this point.
+    sub_mask   = peak_vals >= threshold               # peaks that did NOT cross threshold
+    sub_idx    = neg_peaks[sub_mask]                  # their sample indices
+    sub_amps   = -trace_f[sub_idx]                    # positive amplitudes (< -threshold)
+
+    if sub_amps.size:
+        order       = np.argsort(sub_amps)[::-1]      # descending by amplitude
+        keep_n      = min(500, order.size)
+        next_spikes = sub_idx[order[:keep_n]].astype(int)
+    else:
+        next_spikes = np.empty(0, dtype=int)
+
+
 
     # Plot
     # plt.figure(figsize=(6,4))
@@ -431,7 +361,7 @@ def estimate_spike_threshold_ram(
     # print(threshold)
     # print(len(spikes))
 
-    return threshold, spikes
+    return threshold, spikes, next_spikes
 
 
 
@@ -613,6 +543,237 @@ def fit_two_templates(y, TA, TB_shift):
 
 
 import numpy as np
+from typing import Tuple
+
+def build_channel_weights_twoEI(
+        snipsA_good: np.ndarray,    # [C, T, N_A]  core spikes of unit A
+        snipsB_good: np.ndarray,    # [C, T, N_B]  core spikes of unit B
+        eiA: np.ndarray,            # [C, T]       template A
+        eiB: np.ndarray,            # [C, T]       template B
+        p2p_thresh: float = 30.0,   # ADC threshold for “significant” channels
+        rel_mask: float = 0.01      # |t| >= rel_mask * P2P keeps a sample
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Returns
+    -------
+    weights        : float32 [C_selected]  w_c = max(P2P_A,P2P_B) / σ_c^2
+    selected_chans : int32   [C_selected]  channel indices kept
+    """
+    C, T = eiA.shape
+    # ------------------------------------------------------------------ #
+    # 1. identify channels to keep (either EI ≥ p2p_thresh)
+    p2p_A = eiA.ptp(axis=1)
+    p2p_B = eiB.ptp(axis=1)
+    keep  = (p2p_A >= p2p_thresh) | (p2p_B >= p2p_thresh)
+    sel   = np.where(keep)[0]
+    if sel.size == 0:
+        raise ValueError("No channels pass p2p_thresh")
+
+    # ------------------------------------------------------------------ #
+    # 2. build the *same* boolean mask the scorer will use
+    #    use the template that dominates this channel (larger P2P)
+    mask = np.zeros((sel.size, T), dtype=np.bool_)
+    for k, c in enumerate(sel):
+        if p2p_A[c] >= p2p_B[c]:
+            tmpl = eiA[c]
+            p2p  = p2p_A[c]
+        else:
+            tmpl = eiB[c]
+            p2p  = p2p_B[c]
+        mask[k] = np.abs(tmpl) >= rel_mask * p2p          # [T]
+
+    # ------------------------------------------------------------------ #
+    # 3. gather residuals for variance σ²  (no amplitude scaling)
+    #    use spikes of the unit that dominates this channel
+    sigma2 = np.empty(sel.size, dtype=np.float32)
+
+    for k, c in enumerate(sel):
+        if p2p_A[c] >= p2p_B[c]:
+            # dominant unit A on this channel
+            res = snipsA_good[c] - eiA[c][:, None]        # [T, N_A]
+        else:
+            res = snipsB_good[c] - eiB[c][:, None]        # [T, N_B]
+        # apply same mask: only keep time-points that will matter later
+        res_masked = res[mask[k]]
+        # robust σ via MAD
+        mad   = np.median(np.abs(res_masked))
+        sigma = mad / 0.6745 + 1e-6                      # avoid /0
+        sigma2[k] = sigma * sigma
+
+    # ------------------------------------------------------------------ #
+    # 4. final weights
+    p2p_sel = np.maximum(p2p_A[sel], p2p_B[sel]).astype(np.float32)
+    weights = p2p_sel / sigma2
+    # normalise so mean weight = 1 (optional but convenient)
+    weights /= weights.mean()
+
+    return weights.astype(np.float32), sel.astype(np.int32)
+
+
+
+from numba import njit, prange
+
+
+# ------------------------------------------------------------------------
+# helper: roll array by lag (positive => right shift), zero-pad the vacated end
+@njit(fastmath=True, cache=True)
+def _roll_pad(arr, lag):
+    C, T = arr.shape
+    out  = np.zeros_like(arr)
+    if lag > 0:
+        out[:, lag:] = arr[:, :T-lag]
+    elif lag < 0:
+        out[:, :T+lag] = arr[:, -lag:]
+    else:
+        out[:] = arr
+    return out
+# ------------------------------------------------------------------------
+
+from numba import njit, prange
+import numpy as np
+
+AMP_FACTOR = 2.0     # skip channel if spike P2P > 3× template P2P
+MIN_SAMP   = 3       # need ≥3 masked samples on a channel to keep it
+
+
+@njit(parallel=True, fastmath=True, cache=True)
+def _compute_rms(snips, rolled_templates, rolled_masks,
+                 weights, p2p_template,p2p_global,
+                 residuals, bestlags):
+    """
+    Parameters (same order/shape you already call with)
+    ---------------------------------------------------
+    snips            : float32 [C, T, N]
+    rolled_templates : float32 [nT, nL, C, T]
+    rolled_masks     : bool    [nT, nL, C, T]
+    weights          : float32 [C]            (mean≈1)
+    p2p_template     : float32 [nT, C]        max-abs of each template
+    residuals        : float32 [nT, N]        (output)
+    bestlags         : int16   [nT, N]        (lag index; caller converts)
+    """
+    nT, nL, C, T = rolled_templates.shape
+    N            = snips.shape[2]
+
+    for t in prange(nT):
+        p2p_c = p2p_template[t]                 # view [C]
+
+        for s in range(N):
+            best_r  = 1e20
+            best_li = 0
+
+            for li in range(nL):
+                tmpl = rolled_templates[t, li]
+                mask = rolled_masks[t, li]
+
+                err_tot = 0.0     # weighted sum of channel variances
+                w_sum   = 0.0     # sum of weights actually used
+
+                # ------------ per channel -----------------------------------
+                for c in range(C):
+                    max_abs = 0.0
+                    sum_e   = 0.0
+                    sum_e2  = 0.0
+                    n_mask  = 0
+
+                    for k in range(T):
+                        if mask[c, k]:
+                            val     = snips[c, k, s]
+                            diff    = val - tmpl[c, k]
+                            sum_e  += diff
+                            sum_e2 += diff * diff
+                            n_mask += 1
+                            if abs(val) > max_abs:
+                                max_abs = abs(val)
+
+                    # channel–level guards
+                    if n_mask < MIN_SAMP:
+                        continue
+                    if max_abs > AMP_FACTOR * p2p_global[c]:
+                        continue
+
+                    var_c = (sum_e2 - (sum_e * sum_e) / n_mask) / n_mask
+                    if var_c < 0.0:          # numerical round-off
+                        var_c = 0.0
+
+                    w      = weights[c]
+                    err_tot += w * var_c
+                    w_sum  += w
+
+                if w_sum == 0.0:
+                    continue
+
+                rms = np.sqrt(err_tot / w_sum)
+                if rms < best_r:
+                    best_r  = rms
+                    best_li = li
+
+            residuals[t, s] = best_r
+            bestlags[t, s]  = best_li
+
+
+def compute_residuals_with_lag(snips, templates, weights, max_lag=13, rel_thresh=0.01):
+    """
+    RMS residual between every spike and every template, allowing ±max_lag
+    alignment.  Masks shift together with the template to avoid artefacts.
+    """
+    snips = snips.astype(np.float32, copy=False)
+    temps = np.asarray(templates, dtype=np.float32)
+    n_temp, C, T = temps.shape
+    p2p_template = np.max(np.abs(temps), axis=2).astype(np.float32)  # [n_temp, C]
+
+    _, _, N      = snips.shape
+
+    lags      = np.arange(-max_lag, max_lag + 1, dtype=np.int16)
+    n_lags    = lags.size
+
+    p2p_global = np.max(p2p_template, axis=0).astype(np.float32)  # [C]
+
+    # single unshifted mask (True where any template is “alive”)
+    abs_max_over_templates = np.max(np.abs(templates), axis=0)        # [C,T]
+    master_mask0 = abs_max_over_templates > (rel_thresh * p2p_global[:, None] + 1e-6)
+
+    rolled_templates = np.empty((n_temp, n_lags, C, T), np.float32)
+    rolled_masks     = np.empty((n_temp, n_lags, C, T), np.bool_)
+
+    # for li, L in enumerate(lags):
+    #     rolled_masks[li] = _roll_pad(master_mask0.astype(np.float32), L) > 0.5
+
+    for t in range(n_temp):
+        tmpl = templates[t]
+        for li, L in enumerate(lags):
+            rolled_templates[t, li] = _roll_pad(tmpl, L)
+            rolled_masks[t, li]     = _roll_pad(master_mask0.astype(np.float32), L) > 0.5
+    # # --------------------------------------------------------------------
+    # # build rolled versions of template **and** its mask for every lag
+    # # --------------------------------------------------------------------
+    # rolled_templates = np.zeros((n_temp, n_lags, C, T), dtype=np.float32)
+    # rolled_masks     = np.zeros((n_temp, n_lags, C, T), dtype=np.bool_)
+
+    # for t in range(n_temp):
+    #     tmpl = temps[t]
+    #     p2p  = tmpl.ptp(axis=1)                    # [C]
+    #     mask0 = np.abs(tmpl) > (rel_thresh * p2p[:, None] + 1e-6)
+
+    #     for li, lag in enumerate(lags):
+    #         rolled_templates[t, li] = _roll_pad(tmpl, lag)
+    #         rolled_masks[t, li]     = _roll_pad(mask0.astype(np.float32), lag) > 0.5
+
+    # outputs
+    residuals = np.empty((n_temp, N), dtype=np.float32)
+    bestlags  = np.empty((n_temp, N), dtype=np.int16)
+
+
+
+
+    # heavy lifting
+    _compute_rms(snips, rolled_templates, rolled_masks, weights, p2p_template, p2p_global, residuals, bestlags)
+
+    # translate lag indices back to signed lag values
+    bestlags[:] = lags[bestlags]
+    return residuals, bestlags
+
+
+
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from scipy.ndimage import gaussian_filter1d
@@ -888,6 +1049,15 @@ def compare_ei_subtraction(ei_a, ei_b, max_lag=3, p2p_thresh=30.0):
 
     all_residuals = np.array(all_residuals)
     mean_residual = np.mean(all_residuals)
+
+    if len(all_residuals) == 0:
+        return {'mean_residual': np.nan,
+                'max_abs_residual': np.nan,
+                'good_channels': [],
+                'per_channel_residuals': [],
+                'per_channel_cosine_sim': per_channel_cosine_sim,
+                'fractional_shift': fractional_shift,
+                'p2p_a': p2p_a}
     max_abs_residual = np.max(np.abs(all_residuals))
 
     import matplotlib.pyplot as plt
@@ -1085,6 +1255,239 @@ def merge_similar_clusters_extra(
 
 
 
+def score_spikes_against_template(
+        snips,            # [C, T, N] float32
+        template,         # [C, T]     float32
+        max_lag=3,
+        p2p_thresh=30.0,
+        amp_thresh=-20.0
+):
+    """
+    Return per-spike similarity metrics w.r.t. a fixed EI template.
+    """
+    import numpy as np
+
+    C, T, N = snips.shape
+    p2p     = template.ptp(axis=1)               # [C]
+    core_ch = np.where(p2p >= p2p_thresh)[0]     # indices
+    # core_ch = core_ch[core_ch != ref_channel]
+    w_ch    = p2p[core_ch]                       # weights
+
+    # -------- pre-normalise template on core channels ----------
+    T_core  = template[core_ch]                  # [Ccore, T]
+    T_core  = T_core - T_core.mean(axis=1, keepdims=True)
+    norm_T  = np.linalg.norm(T_core, axis=1) + 1e-12  # per-channel L2
+
+    scores  = np.empty(N, dtype=[('score','f4'),
+                                 ('n_bad','i4'),
+                                 ('lag', 'i2')])
+
+    # ------- brute-force lag search (N small so OK) -------------
+    lags = np.arange(-max_lag, max_lag+1, dtype=int)
+    for n in range(N):
+        best_s, best_bad, best_lag = -np.inf, 0, 0
+        X = snips[:, :, n]
+
+        for lag in lags:
+            if lag < 0:
+                Xseg = X[core_ch, :lag]               # [Ccore, T+lag]
+                Tseg = T_core[:, -lag:]
+            elif lag > 0:
+                Xseg = X[core_ch, lag:]
+                Tseg = T_core[:, :-lag]
+            else:
+                Xseg = X[core_ch]
+                Tseg = T_core
+
+            # zero-mean the snippet on each channel
+            Xseg = Xseg - Xseg.mean(axis=1, keepdims=True)
+
+            # cosine per channel
+            dot     = (Xseg * Tseg).sum(axis=1)
+            norm_X  = np.linalg.norm(Xseg, axis=1) + 1e-12
+            cos_ch  = dot / (norm_T * norm_X)
+
+            # residual at template peak position
+            peak_idx = np.argmin(Tseg, axis=1)
+            resid    = Xseg[np.arange(len(core_ch)), peak_idx] - \
+                       Tseg[np.arange(len(core_ch)), peak_idx]
+            n_bad    = (resid < amp_thresh).sum()
+
+            # weighted average cosine
+            w_cos    = np.average(cos_ch, weights=w_ch)
+            if w_cos > best_s:
+                best_s, best_bad, best_lag = w_cos, int(n_bad), int(lag)
+
+        scores['score'][n] = best_s
+        scores['n_bad'][n] = best_bad
+        scores['lag'][n]   = best_lag
+
+    return scores        # dtype [('score','f4'), ('n_bad','i4'), ('lag','i2')]
+
+
+def per_channel_cosine_scores(
+        snips,            # [C, T, N]  float32
+        template,         # [C, T]      float32
+        max_lag=3,
+        p2p_thresh=30.0
+):
+    """
+    Return per-channel cosine similarities to 'template' for every spike.
+
+    Parameters
+    ----------
+    snips      : waveform snippets [channels, samples, spikes]
+    template   : EI template of the unit [channels, samples]
+    max_lag    : ± samples to search for best alignment (int)
+    p2p_thresh : keep only channels whose template P2P ≥ this (µV)
+
+    Returns
+    -------
+    cosines : array  [C_core, N]   un-weighted cosine per channel & spike
+    best_lag: array  [N]           chosen lag for each spike (−max_lag…+max_lag)
+    core_idx: array  [C_core]      channel indices kept
+    """
+    C, T, N = snips.shape
+
+    # --- core channels -------------------------------------------------------
+    p2p       = template.ptp(axis=1)                      # [C]
+    core_idx  = np.where(p2p >= p2p_thresh)[0]
+    if core_idx.size == 0:
+        raise ValueError("No channels pass p2p_thresh")
+
+    T_core    = template[core_idx]                       # [Ccore, T]
+    T_core    = T_core - T_core.mean(axis=1, keepdims=True)
+    norm_T    = np.linalg.norm(T_core, axis=1) + 1e-12   # [Ccore]
+
+    # --- allocate output -----------------------------------------------------
+    cosines   = np.empty((core_idx.size, N), dtype=np.float32)
+    best_lag  = np.empty(N, dtype=np.int16)
+
+    lags = np.arange(-max_lag, max_lag + 1, dtype=int)
+
+    # --- per-spike loop (vectorise later if needed) --------------------------
+    for n in range(N):
+        X = snips[:, :, n]
+
+        best_mean_cos = -np.inf
+        best_cos      = None
+        best_l        = 0
+
+        for l in lags:
+            if l < 0:
+                Xseg = X[core_idx, :l]
+                Tseg = T_core[:, -l:]
+            elif l > 0:
+                Xseg = X[core_idx, l:]
+                Tseg = T_core[:, :-l]
+            else:
+                Xseg = X[core_idx]
+                Tseg = T_core
+
+            Xseg = Xseg - Xseg.mean(axis=1, keepdims=True)
+            norm_X = np.linalg.norm(Xseg, axis=1) + 1e-12
+            cos_ch = np.sum(Xseg * Tseg, axis=1) / (norm_T * norm_X)
+
+            mean_cos = cos_ch.mean()
+            if mean_cos > best_mean_cos:
+                best_mean_cos = mean_cos
+                best_cos      = cos_ch
+                best_l        = l
+
+        cosines[:, n] = best_cos
+        best_lag[n]   = best_l
+
+    return cosines, best_lag, core_idx
+
+import numpy as np
+
+def score_shape_amp_resid(
+        snips,            # [C, T, N]   float32
+        template,         # [C, T]      float32
+        max_lag=3,        # ± samples searched for best alignment
+        p2p_thresh=30.0   # µV threshold for “core” channels
+):
+    """
+    Compare each spike to a fixed template channel-by-channel.
+
+    Returns
+    -------
+    cosines : [Ccore, N]   (float32)  plain cosine similarity
+    alpha   : [Ccore, N]   (float32)  LS gain  α = <x,t>/<t,t>
+    resid   : [Ccore, N]   (float32)  RMS of (x − αt)
+    bestlag : [N]          (int16)    lag (–max_lag…+max_lag) chosen for each spike
+    coreidx : [Ccore]      (int16)    indices of core channels kept
+    """
+    C, T, N = snips.shape
+
+    # -------- core channels --------
+    p2p       = template.ptp(axis=1)
+    coreidx   = np.where(p2p >= p2p_thresh)[0]
+    if coreidx.size == 0:
+        raise ValueError("No channels above p2p_thresh")
+
+    T_core    = template[coreidx].copy()
+    T_core   -= T_core.mean(axis=1, keepdims=True)          # zero-mean per ch
+    norm_T2   = np.sum(T_core**2, axis=1) + 1e-12           # [Ccore]
+
+    # -------- outputs --------------
+    Ccore     = coreidx.size
+    cosines   = np.empty((Ccore, N), dtype=np.float32)
+    alpha     = np.empty_like(cosines)
+    resid     = np.empty_like(cosines)
+    bestlag   = np.empty(N, dtype=np.int16)
+
+    lags = np.arange(-max_lag, max_lag + 1, dtype=int)
+
+    # -------- per-spike loop -------
+    for n in range(N):
+        X = snips[:, :, n]                       # [C, T]
+
+        best_mean_cos = -np.inf
+        best_a   = best_r = best_c = None
+        best_l   = 0
+
+        for l in lags:
+            if l < 0:
+                Xseg = X[coreidx, :l]            # [Ccore, T+l]
+                Tseg = T_core[:, -l:]
+            elif l > 0:
+                Xseg = X[coreidx, l:]
+                Tseg = T_core[:, :-l]
+            else:
+                Xseg = X[coreidx]
+                Tseg = T_core
+
+            Xseg  = Xseg - Xseg.mean(axis=1, keepdims=True)
+
+            # α per channel
+            dot_xt   = np.sum(Xseg * Tseg, axis=1)
+            a_ch     = dot_xt / norm_T2
+            # residual RMS per channel
+            res_ch   = Xseg - a_ch[:, None] * Tseg
+            rms_ch   = np.sqrt(np.mean(res_ch**2, axis=1))
+
+            # cosine per channel
+            norm_X2  = np.sum(Xseg**2, axis=1) + 1e-12
+            cos_ch   = dot_xt / np.sqrt(norm_T2 * norm_X2)
+
+            mean_cos = cos_ch.mean()
+            if mean_cos > best_mean_cos:
+                best_mean_cos = mean_cos
+                best_a   = a_ch
+                best_r   = rms_ch
+                best_c   = cos_ch
+                best_l   = l
+
+        cosines[:, n] = best_c
+        alpha[:, n]   = best_a
+        resid[:, n]   = best_r
+        bestlag[n]    = best_l
+
+    return cosines, alpha, resid, bestlag, coreidx
+
+
+
 
 def merge_similar_clusters(snips, labels, max_lag=3, p2p_thresh=30.0, amp_thresh=-20, cos_thresh=0.8):
     cluster_ids = sorted(np.unique(labels))
@@ -1190,11 +1593,11 @@ def merge_similar_clusters(snips, labels, max_lag=3, p2p_thresh=30.0, amp_thresh
                     # n_bad = n_bad_channels[existing, j]
 
                     accept = False
-                    if sim_ij >= 0.95 and n_bad <= 6:
+                    if sim_ij >= cos_thresh+0.15 and n_bad <= 6:
                         accept = True
-                    elif sim_ij >= 0.9 and n_bad <= 4:
+                    elif sim_ij >= cos_thresh+0.1 and n_bad <= 4:
                         accept = True
-                    elif sim_ij >= 0.8 and n_bad == 2:
+                    elif sim_ij >= cos_thresh+0.05 and n_bad == 2:
                         accept = True
                     elif sim_ij >= cos_thresh and n_bad == 0:
                         accept = True
@@ -1417,8 +1820,9 @@ def cluster_spike_waveforms(
     max_chan: int = 80,
     sim_threshold: float = 0.9,
     merge: bool = True,
-    return_debug: bool = False,   # ← new
-    plot_diagnostic: bool = False
+    return_debug: bool = False, 
+    plot_diagnostic: bool = False,
+    print_diagnostic: bool = False
 ) -> Union[list[dict], Tuple[list[dict], np.ndarray, np.ndarray, np.ndarray, list[np.ndarray]]]:
     """
     Cluster spike waveforms based on selected EI channels and merge using EI similarity.
@@ -1505,13 +1909,14 @@ def cluster_spike_waveforms(
                 n1 = np.sum(group1_mask)
                 n2 = np.sum(group2_mask)
 
-                if n1 < 20 or n2 < 20:
+                if print_diagnostic and (n1 < 20 or n2 < 20):
                     print(f"  Cluster {cl} split discarded: would create small cluster (group1={n1}, group2={n2})")
                     continue
 
                 # Assign new label to group2 (or vice versa)
                 labels_updated[cluster_indices[group2_mask]] = next_label
-                print(f"  Cluster {cl} split into {cl} and {next_label}")
+                if print_diagnostic:
+                    print(f"  Cluster {cl} split into {cl} and {next_label}")
 
                 # Add both parts back to check if large enough
                 if np.sum(group1_mask) >= 20:
@@ -1573,7 +1978,7 @@ def cluster_spike_waveforms(
     if plot_diagnostic == True:
         import matplotlib.pyplot as plt
 
-        plt.figure(figsize=(6, 5))
+        plt.figure(figsize=(5, 3))
         for i in np.unique(labels):
             cluster_points = pcs[labels == i]
             plt.scatter(cluster_points[:, 0], cluster_points[:, 1], label=f"Cluster {i+1}", s=10)
@@ -1635,6 +2040,504 @@ def cluster_spike_waveforms(
         return output, pcs, labels, sim, n_bad_channels, cluster_eis, cluster_to_merged_group
     else:
         return output
+
+
+from scipy.stats import median_abs_deviation as mad
+
+# This is a high-level scaffold. It assumes external access to the following utils:
+# - extract_snippets_fast_ram
+# - score_spikes_against_template
+# - build_channel_weights_twoEI
+# - compute_residuals_with_lag
+
+def collision_model_two_unit(
+    raw_data,
+    spike_times,
+    snips_baselined,
+    clusters,
+    cluster_ids,
+    window=(-20, 60),
+    p2p_thresh=30.0,
+    score_z_thresh=1.0,
+    max_lag=5,
+    rel_mask=0.1,
+    rel_thresh=0.1,
+    plotting=False
+):
+    """
+    Parameters:
+    ----------
+    raw_data     : np.ndarray, shape [C, T_total]
+    spike_times  : np.ndarray, shape [N_total], all spike times in absolute samples
+    clusters     : dict of cluster_id -> list of spike times (subset of spike_times)
+    cluster_ids  : tuple (A_id, B_id)
+
+    Returns:
+    -------
+    best_template_idx : [N_tested] int
+    lag_matrix        : [N_templates, N_tested]
+    residual_matrix   : [N_templates, N_tested]
+    """
+
+    A_id, B_id = cluster_ids
+    spikesA = spike_times[clusters[A_id]['inds']]
+    spikesB = spike_times[clusters[B_id]['inds']]
+    print(len(spikesA))
+    print(len(spikesB))
+
+    n_channels = raw_data.shape[1]
+
+
+    # --- Step 1: Extract snippets ---
+    # snipsA, _ = extract_snippets_fast_ram(raw_data, spikesA, window, np.arange(n_channels))
+    # snipsB, _ = extract_snippets_fast_ram(raw_data, spikesB, window, np.arange(n_channels))
+    indsA = clusters[A_id]['inds']
+    snipsA = snips_baselined[:, :, indsA]
+    indsB = clusters[B_id]['inds']
+    snipsB = snips_baselined[:, :, indsB]
+
+    print("finished extracting snippets")
+
+
+    # --- Step 2: Score spikes against their own template ---
+    eiA = np.mean(snipsA, axis=2)
+    eiB = np.mean(snipsB, axis=2)
+
+    scoreA = score_spikes_against_template(snipsA, eiA)['score']
+    scoreB = score_spikes_against_template(snipsB, eiB)['score']
+
+    print("finished scoring against template")
+
+    zA = (scoreA - np.median(scoreA)) / (mad(scoreA) + 1e-6)
+    zB = (scoreB - np.median(scoreB)) / (mad(scoreB) + 1e-6)
+
+    goodA = np.where(zA > 2)[0]
+    badA  = np.where(zA <= -score_z_thresh)[0]
+    goodB = np.where(zB > 2)[0]
+    badB  = np.where(zB <= -score_z_thresh)[0]
+
+    # goodA / goodB / badB are *positions inside* indsA / indsB
+    snipsA_good = snips_baselined[:, :, indsA[goodA]]    # C × T × N_goodA
+    snipsB_good = snips_baselined[:, :, indsB[goodB]]    # C × T × N_goodB
+    snips_test   = snips_baselined[:, :, indsA[badA]]    # C × T × N_badB  (collision candidates)
+    test_inds = indsA[badA]
+    print(len(badA))
+    print(len(goodA))
+
+    eiA = np.mean(snipsA_good, axis=2)
+    eiB = np.mean(snipsB_good, axis=2)
+
+    # --- Step 3: Construct collision templates ---
+    collision_templates = [eiA.copy(), eiB.copy(), eiA + eiB]
+    template_labels = ["A", "B", "A+B (lag 0)"]
+
+    T = eiA.shape[1]
+    for lag in range(1, 25):
+        t1 = eiA.copy()
+        t1[:, lag:] += eiB[:, :T - lag]
+        collision_templates.append(t1)
+        template_labels.append(f"A + B (lag {lag})")
+
+        t2 = eiB.copy()
+        t2[:, lag:] += eiA[:, :T - lag]
+        collision_templates.append(t2)
+        template_labels.append(f"B + A (lag {lag})")
+
+    collision_templates = np.array(collision_templates, dtype=np.float32)  # [n_templates, C, T]
+    print("finished template building")
+
+
+    # --- Step 4: Select channels and compute weights ---
+    weights, selected_chans = build_channel_weights_twoEI(
+        snipsA_good, snipsB_good, eiA, eiB,
+        p2p_thresh=p2p_thresh,
+        rel_mask=rel_mask
+    )
+    print("finished weight")
+    templates_sel = collision_templates[:, selected_chans, :]  # [n_templates, C_sel, T]
+    snips_sel     = snips_test[selected_chans, :, :].copy()
+
+    # --- Step 5: Score all bad spikes against template dictionary ---
+    residual_matrix, lag_matrix = compute_residuals_with_lag(
+        snips_sel,
+        templates_sel,
+        weights=weights,
+        max_lag=max_lag,
+        rel_thresh=rel_thresh
+    )
+    print("finished scoring")
+
+    best_template_idx = np.argmin(residual_matrix, axis=0)  # [N_spikes]
+
+    for i, t_idx in enumerate(best_template_idx):
+        label = template_labels[t_idx]
+        resid = residual_matrix[t_idx, i]
+        print(f"Spike {i:4d}: best match = {label:<8} | residual = {resid:.4f}")
+
+    if plotting:
+        import matplotlib.pyplot as plt
+        i = 9 # example spike index to plot
+        channels_to_plot = [395,403,402,394]#selected_chans[:min(8, len(selected_chans))]  # pick a few channels for visualization
+        extra_templates = [0, 1]  # just show solo A and B for context
+
+        x = snips_sel[:, :, i]  # [C, T]
+        t_idx = best_template_idx[i]
+        best_template = templates_sel[t_idx]  # restrict to selected channels
+        best_label = template_labels[t_idx]
+        lag = lag_matrix[t_idx, i]
+
+        C, T = x.shape
+        if lag < 0:
+            lag_abs = abs(lag)
+            templ_shifted = best_template[:, lag_abs:]
+            spike_segment = x[:, :T - lag_abs]
+        elif lag > 0:
+            templ_shifted = best_template[:, :T - lag]
+            spike_segment = x[:, lag:]
+        else:
+            templ_shifted = best_template
+            spike_segment = x
+
+        min_len = min(templ_shifted.shape[1], spike_segment.shape[1])
+        templ_shifted = templ_shifted[:, :min_len]
+        spike_segment = spike_segment[:, :min_len]
+
+
+        assert templ_shifted.shape == spike_segment.shape, "Shape mismatch after alignment truncation"
+
+        # 🟢 Then continue with the original plotting block:
+        # Plotting
+        n_channels = len(channels_to_plot)
+        cols = min(n_channels, 4)
+        rows = int(np.ceil(n_channels / cols))
+        fig, axs = plt.subplots(rows, cols, figsize=(cols * 4, rows * 3), squeeze=False)
+        axs = axs.flatten()
+
+        for idx, ch in enumerate(channels_to_plot):
+            if ch not in selected_chans:
+                print(f"Channel {ch} not in selected_chans — skipping")
+                continue
+
+            local_idx = np.where(selected_chans == ch)[0][0]  # convert global → local index
+
+            axs[idx].plot(spike_segment[local_idx], color='black', linewidth=1, label='Spike')
+            axs[idx].plot(templ_shifted[local_idx], color='red', linewidth=1.2, label=f'{best_label} (lag {lag})')
+
+            for tidx in extra_templates:
+                t_extra = templates_sel[tidx]  # already channel-selected
+                if lag < 0:
+                    t_extra_shifted = t_extra[:, abs(lag):]
+                elif lag > 0:
+                    t_extra_shifted = t_extra[:, :T - lag]
+                else:
+                    t_extra_shifted = t_extra
+
+                t_extra_shifted = t_extra_shifted[:, :min_len]
+                axs[idx].plot(t_extra_shifted[local_idx], linestyle='--', linewidth=1, label=f'{template_labels[tidx]}')
+
+
+        for j in range(idx + 1, len(axs)):
+            axs[j].axis('off')
+
+        fig.suptitle(f"Spike {i} assigned to '{best_label}'", fontsize=10)
+        plt.tight_layout()
+        plt.subplots_adjust(top=0.9)
+        plt.show()
+
+    return (
+        best_template_idx,
+        lag_matrix,
+        residual_matrix,
+        template_labels,
+        test_inds,
+        templates_sel,      # [n_templates × C_sel × T]
+        weights,            # [C_sel]
+        selected_chans      # [C_sel] — global channel indices
+    )
+
+
+import numpy as np
+from typing import Tuple, List
+from numba import njit, prange
+from scipy.signal import correlate
+
+# --------------------------------------------------------------------
+# ❶  helper: roll array by lag (positive → right shift), zero-pad vacated end
+@njit(fastmath=True, cache=True)
+def _roll_pad(arr, lag):
+    C, T = arr.shape
+    out  = np.zeros_like(arr)
+    if lag > 0:
+        out[:, lag:] = arr[:, :T-lag]
+    elif lag < 0:
+        out[:, :T+lag] = arr[:, -lag:]
+    else:
+        out[:] = arr
+    return out
+# --------------------------------------------------------------------
+
+
+@njit(parallel=True, fastmath=True, cache=True)
+def _compute_rms(snips, rolled_templates, rolled_masks,
+                 weights, p2p_template, p2p_global,
+                 residuals, bestlags):
+    """
+    Heavy inner loop: identical to the one already in axolotl_utils_ram.py,
+    but reused here for clarity.
+    """
+    nT, nL, C, T = rolled_templates.shape
+    N            = snips.shape[2]
+
+    for t in prange(nT):
+        p2p_c = p2p_template[t]
+
+        for s in range(N):
+            best_r  = 1e20
+            best_li = 0
+
+            for li in range(nL):
+                tmpl = rolled_templates[t, li]
+                mask = rolled_masks[t, li]
+
+                err_tot = 0.0
+                w_sum   = 0.0
+
+                # per-channel RMS
+                for c in range(C):
+                    max_abs = 0.0
+                    sum_e   = 0.0
+                    sum_e2  = 0.0
+                    n_mask  = 0
+
+                    for k in range(T):
+                        if mask[c, k]:
+                            val     = snips[c, k, s]
+                            diff    = val - tmpl[c, k]
+                            sum_e  += diff
+                            sum_e2 += diff * diff
+                            n_mask += 1
+                            if abs(val) > max_abs:
+                                max_abs = abs(val)
+
+                    if n_mask < 3:
+                        continue
+                    if max_abs > 2.0 * p2p_global[c]:   # AMP_FACTOR = 2
+                        continue
+
+                    var_c = (sum_e2 - (sum_e * sum_e) / n_mask) / n_mask
+                    if var_c < 0.0:
+                        var_c = 0.0
+
+                    w      = weights[c]
+                    err_tot += w * var_c
+                    w_sum  += w
+
+                if w_sum == 0.0:
+                    continue
+
+                rms = np.sqrt(err_tot / w_sum)
+                if rms < best_r:
+                    best_r  = rms
+                    best_li = li
+
+            residuals[t, s] = best_r
+            bestlags[t, s]  = best_li
+# --------------------------------------------------------------------
+
+
+def collision_model_two_templates(
+    snips: np.ndarray,                 # [C, T, N]  float32   – snippets (baseline-subtracted)
+    eiA:   np.ndarray,                 # [C, T]      float32   – template A
+    eiB:   np.ndarray,                 # [C, T]      float32   – template B
+    *,
+    max_lag:       int   = 25,         # build combos up to this lag (samples, ≥1)
+    p2p_thresh:    float = 30.0,       # keep channels where max(P2P_A, P2P_B) ≥ thresh
+    rel_mask:      float = 0.01,       # |t| ≥ rel_mask·P2P keeps a sample
+    rel_thresh:    float = 0.10,        # threshold inside compute_residuals_with_lag
+    plotting: False
+) -> Tuple[
+        np.ndarray, np.ndarray, np.ndarray, List[str],
+        np.ndarray, np.ndarray, np.ndarray
+     ]:
+    """
+    Score EVERY spike against {A, B, A+B_lagged, B+A_lagged} template dictionary.
+
+    Returns
+    -------
+    best_template_idx : [N]      int      – index in template_labels
+    lag_matrix        : [M, N]   int16    – chosen lag for each template/spike
+    residual_matrix   : [M, N]   float32  – RMS residuals
+    template_labels   : list[str]         – human-readable labels
+    templates_sel     : [M, Csel, T]      – rolled templates (selected channels)
+    weights           : [Csel]   float32  – per-channel weights (mean = 1)
+    selected_chans    : [Csel]   int32    – global channel indices kept
+    """
+
+    # ------------------------------------------------------------
+    # 1. channel selection & simple weights
+    # ------------------------------------------------------------
+    C, T = eiA.shape
+    p2p_A = eiA.ptp(axis=1)
+    p2p_B = eiB.ptp(axis=1)
+    keep  = np.where(np.maximum(p2p_A, p2p_B) >= p2p_thresh)[0]
+    if keep.size == 0:
+        raise ValueError("No channels pass p2p_thresh")
+
+    selected_chans = keep.astype(np.int32)
+    weights        = np.maximum(p2p_A[keep], p2p_B[keep]).astype(np.float32)
+    weights       /= weights.mean()                      # normalise
+
+    # weights, selected_chans = build_channel_weights_twoEI(
+    #     snips, snips, eiA, eiB,
+    #     p2p_thresh=p2p_thresh,
+    #     rel_mask=rel_mask
+    # )
+
+    # ------------------------------------------------------------
+    # 2. build template dictionary
+    # ------------------------------------------------------------
+    templates = [eiA, eiB, eiA + eiB]          # lag 0 combos
+    labels    = ["A", "B", "A+B (lag 0)"]
+
+    for lag in range(1, max_lag + 1):
+        # A then B
+        t_AB = np.zeros_like(eiA)
+        if lag < T:
+            t_AB[:, :-lag] = eiA[:, :-lag] + eiB[:, lag:]
+        templates.append(t_AB)
+        labels.append(f"A+B (lag {lag})")
+
+        # B then A
+        t_BA = np.zeros_like(eiA)
+        if lag < T:
+            t_BA[:, :-lag] = eiB[:, :-lag] + eiA[:, lag:]
+        templates.append(t_BA)
+        labels.append(f"B+A (lag {lag})")
+
+    templates = np.array(templates, dtype=np.float32)    # [M, C, T]
+
+    # ------------------------------------------------------------
+    # 3. restrict to selected channels
+    # ------------------------------------------------------------
+    templates_sel = templates[:, selected_chans, :]      # [M, Csel, T]
+    snips_sel     = snips[selected_chans, :, :].copy()   # [Csel, T, N]
+
+    # ------------------------------------------------------------
+    # 4. build masks & rolled versions for lag search
+    # ------------------------------------------------------------
+    n_temp  = templates_sel.shape[0]
+    lags    = np.arange(-max_lag, max_lag + 1, dtype=np.int16)
+    n_lags  = lags.size
+    Csel    = templates_sel.shape[1]
+
+    # master mask: union of |template| > rel_mask·p2p over all templates
+    p2p_global = np.max(np.abs(templates_sel), axis=(0,2)).astype(np.float32)   # [Csel]
+    master_mask0 = np.max(np.abs(templates_sel), axis=0) > (rel_mask * p2p_global[:,None] + 1e-6)
+
+    rolled_templates = np.empty((n_temp, n_lags, Csel, T), np.float32)
+    rolled_masks     = np.empty_like(rolled_templates, dtype=np.bool_)
+
+    for t in range(n_temp):
+        tmpl = templates_sel[t]
+        for li, L in enumerate(lags):
+            rolled_templates[t, li] = _roll_pad(tmpl, L)
+            rolled_masks[t, li]     = _roll_pad(master_mask0.astype(np.float32), L) > 0.5
+
+    p2p_template = np.max(np.abs(templates_sel), axis=2).astype(np.float32)   # [M, Csel]
+
+    # ------------------------------------------------------------
+    # 5. residual computation (uses the numba kernel above)
+    # ------------------------------------------------------------
+    N = snips_sel.shape[2]
+    residuals = np.empty((n_temp, N), dtype=np.float32)
+    bestlags  = np.empty((n_temp, N), dtype=np.int16)
+
+    _compute_rms(snips_sel, rolled_templates, rolled_masks,
+                 weights, p2p_template, p2p_global,
+                 residuals, bestlags)
+
+    # translate lag indices → signed lag values
+    bestlags[:] = lags[bestlags]
+
+    best_template_idx = np.argmin(residuals, axis=0)      # [N]
+
+    if plotting:
+        import matplotlib.pyplot as plt
+
+        spikes_to_plot = [0,12,  296]  # replace with any list of spike indices
+        channels_to_plot = [ 49,  52,  57, 209, 210]  # global channel IDs
+        extra_templates = [0, 1]  # indices of templates to overlay
+
+        for i in spikes_to_plot:
+            x = snips_sel[:, :, i]  # [Csel, T]
+            t_idx = best_template_idx[i]
+            best_template = templates_sel[t_idx]
+            best_label = labels[t_idx]
+            lag = bestlags[t_idx, i]
+
+            C, T = x.shape
+            if lag < 0:
+                lag_abs = abs(lag)
+                templ_shifted = best_template[:, lag_abs:]
+                spike_segment = x[:, :T - lag_abs]
+            elif lag > 0:
+                templ_shifted = best_template[:, :T - lag]
+                spike_segment = x[:, lag:]
+            else:
+                templ_shifted = best_template
+                spike_segment = x
+
+            min_len = min(templ_shifted.shape[1], spike_segment.shape[1])
+            templ_shifted = templ_shifted[:, :min_len]
+            spike_segment = spike_segment[:, :min_len]
+
+            assert templ_shifted.shape == spike_segment.shape, "Shape mismatch after alignment truncation"
+
+            # Plotting
+            n_channels = len(channels_to_plot)
+            cols = min(n_channels, 6)
+            rows = int(np.ceil(n_channels / cols))
+            fig, axs = plt.subplots(rows, cols, figsize=(cols * 4, rows * 3), squeeze=False)
+            axs = axs.flatten()
+
+            for idx, ch in enumerate(channels_to_plot):
+                if ch not in selected_chans:
+                    print(f"Channel {ch} not in selected_chans — skipping")
+                    continue
+
+                local_idx = np.where(selected_chans == ch)[0][0]  # convert global → local index
+
+                axs[idx].plot(spike_segment[local_idx], color='black', linewidth=1, label='Spike')
+                axs[idx].plot(templ_shifted[local_idx], color='red', linewidth=1.2,
+                            label=f'{best_label} (lag {lag})')
+
+                for tidx in extra_templates:
+                    t_extra = templates_sel[tidx]
+                    if lag < 0:
+                        t_extra_shifted = t_extra[:, abs(lag):]
+                    elif lag > 0:
+                        t_extra_shifted = t_extra[:, :T - lag]
+                    else:
+                        t_extra_shifted = t_extra
+
+                    t_extra_shifted = t_extra_shifted[:, :min_len]
+                    axs[idx].plot(t_extra_shifted[local_idx], linestyle='--', linewidth=1, label=f'{labels[tidx]}')
+
+                axs[idx].set_title(f"Channel {ch}", fontsize=9)
+                axs[idx].legend(fontsize=7)
+
+            for j in range(idx + 1, len(axs)):
+                axs[j].axis('off')
+
+            fig.suptitle(f"Spike {i} assigned to '{best_label}'", fontsize=12)
+            plt.tight_layout()
+            plt.subplots_adjust(top=0.9)
+            plt.show()
+
+
+    return (best_template_idx, bestlags, residuals,
+            labels, templates_sel, weights, selected_chans)
+
 
 
 def select_cluster_with_largest_waveform(
@@ -2223,604 +3126,6 @@ def apply_residuals(
         del data_disk
 
 
-import numpy as np
-from scipy.signal import correlate
-
-
-
-
-
-def plot_unit_diagnostics(
-    output_path: str,
-    unit_id: int,
-    pcs_pre: np.ndarray,
-    labels_pre: np.ndarray,
-    sim_matrix_pre: np.ndarray,
-    cluster_eis_pre: np.ndarray,
-    spikes_for_plot_pre: np.ndarray,
-    n_bad_channels_pre: np.ndarray,
-    contributing_original_ids_pre: np.ndarray,
-    mean_score: np.ndarray,
-    valid_score: np.ndarray,
-    mean_scores_at_spikes: np.ndarray,
-    valid_scores_at_spikes: np.ndarray,
-    mean_thresh: float,
-    valid_thresh: float,
-    lags: np.ndarray,
-    bad_spike_traces: np.ndarray,
-    good_mean_trace: np.ndarray,
-    threshold_ampl: float,
-    ref_channel: int,
-    snips_bad: np.ndarray,
-    pcs_post: np.ndarray,
-    labels_post: np.ndarray,
-    sim_matrix_post: np.ndarray,
-    spikes_for_plot_post: np.ndarray,
-    n_bad_channels_post: np.ndarray,
-    contributing_original_ids_post: np.ndarray,
-    cluster_eis_post: np.ndarray,
-    window: tuple,
-    ei_positions: np.ndarray,
-    selected_channels_count: int,
-    spikes: np.ndarray,
-    orig_threshold: float,
-    ks_matches: list
-):
-    
-    # --- STA generation ---
-    sta_depth = 30
-    sta_offset = 0
-    sta_chunk_size = 1000
-    sta_refresh = 2
-    fs = 20000  # sampling rate in Hz
-
-    triggers_mat_path='/Volumes/Lab/Users/alexth/axolotl/trigger_in_samples_201703151.mat'
-
-    triggers = loadmat(triggers_mat_path)['triggers'].flatten() # triggers in s
-
-    lut = np.array([
-        [255, 255, 255],
-        [255, 255,   0],
-        [255,   0, 255],
-        [255,   0,   0],
-        [0,   255, 255],
-        [0,   255,   0],
-        [0,     0, 255],
-        [0,     0,   0]
-    ], dtype=np.uint8).flatten()
-    
-    generator = RGBFrameGenerator('/Volumes/Lab/Users/alexth/axolotl/sta/libdraw_rgb.so')
-    generator.configure(width=20, height=40, lut=lut, noise_type=1, n_bits=3)
-
-    # --- FIGURE setup ---
-
-    fig = plt.figure(figsize=(16, 32))
-    gs = gridspec.GridSpec(7, 4, height_ratios=[0.7, 2.0, 0.7, 0.7, 0.7, 2, 0.7], width_ratios=[1, 1, 1, 1], wspace=0.25)
-
-    # --- Row 1: PCA pre-merge and sim matrix ---
-    row1_gs = gridspec.GridSpecFromSubplotSpec(1, 5, subplot_spec=gs[0, :], wspace=0.05)
-
-    ax1 = fig.add_subplot(row1_gs[0])
-    ax1.set_title("Initial PCA (pre-merge)")
-    for lbl in np.unique(labels_pre):
-        pts = pcs_pre[labels_pre == lbl]
-        ax1.scatter(pts[:, 0], pts[:, 1], s=5, label=f"{len(pts)} sp")
-        # ax1.scatter(pts[:, 0], pts[:, 1], s=5, label=f"Cluster {lbl} (N={len(pts)})")
-    ax1.set_xlabel("PC1")
-    ax1.set_ylabel("PC2")
-    ax1.set_aspect('equal', adjustable='box')
-    ax1.grid(True)
-    ax1.legend(
-        loc='upper center',
-        bbox_to_anchor=(0.5, -0.15),  # x=center, y=below the axis
-        ncol=len(np.unique(labels_pre)),  # spread horizontally
-        fontsize=14,
-        frameon=False
-    )
-
-    # ax1_legend = fig.add_subplot(gs[0, 1])
-    # ax1_legend.axis('off')
-    # ax1_legend.legend(*ax1.get_legend_handles_labels(), loc='center left', fontsize=14)
-
-    # Extract cluster labels
-    cluster_ids_pre = sorted(np.unique(labels_pre))
-    # Get default matplotlib color cycle
-    default_colors = itertools.cycle(rcParams['axes.prop_cycle'].by_key()['color'])
-    # Build color list in order of cluster appearance
-    colors_pre = [next(default_colors) for _ in cluster_ids_pre]
-
-    ax2 = fig.add_subplot(row1_gs[1])
-    ax2.set_title("Similarity Matrix (Pre)")
-
-    label_matrix = np.empty_like(sim_matrix_pre, dtype=object)
-    n = sim_matrix_pre.shape[0]
-    for i in range(n):
-        for j in range(n):
-            score = sim_matrix_pre[i, j]
-            n_bad = n_bad_channels_pre[i, j]
-            label_matrix[i, j] = f"{score:.2f}/{n_bad}"
-
-
-    tb = Table(ax2, bbox=[0.2, 0.2, 0.8, 0.8])
-    n = sim_matrix_pre.shape[0]
-    for i in range(n):
-        for j in range(n):
-            tb.add_cell(i, j, 1/n, 1/n, text=label_matrix[i, j], loc='center')
-    for i in range(n):
-        tb.add_cell(i, -1, 1/n, 1/n, text=str(i), loc='right', edgecolor='none')
-        tb.add_cell(-1, i, 1/n, 1/n, text=str(i), loc='center', edgecolor='none')
-    ax2.add_table(tb)
-    ax2.axis('off')
-
-    s0 = spikes_for_plot_pre[labels_pre == 0]
-    s1 = spikes_for_plot_pre[labels_pre == 1]
-    s2 = spikes_for_plot_pre[labels_pre == 2]
-
-    if len(s0) > 0 and s0[0]>0:
-        ax_sta0 = fig.add_subplot(row1_gs[2])   # STA cluster 0
-        sta = compute_sta_chunked(
-            spikes_sec=s0/fs,
-            triggers_sec=triggers,
-            generator=generator,
-            seed=11111,
-            depth=sta_depth,
-            offset=sta_offset,
-            chunk_size=sta_chunk_size,
-            refresh=sta_refresh
-        )
-        # Time course from peak pixel
-        max_idx = np.unravel_index(np.abs(sta).argmax(), sta.shape)
-        # Display STA frame at peak time
-        peak_frame = max_idx[3]
-        if peak_frame>7 or peak_frame<3:
-            peak_frame = 4
-        rgb = sta[:, :, :, peak_frame]
-        vmax = np.max(np.abs(sta)) * 2
-        norm_rgb = rgb / vmax + 0.5
-        norm_rgb = np.clip(norm_rgb, 0, 1)
-
-        ax_sta0.imshow(norm_rgb.transpose(1, 0, 2), origin='upper')
-        ax_sta0.set_title(f"STA Frame {peak_frame + 1}", fontsize=10)
-        ax_sta0.set_aspect('equal')
-        ax_sta0.axis('off')
-        ax_sta0.set_position(ax_sta0.get_position().expanded(1.1, 1.0))
-
-
-    if len(s1) > 0 and s1[0]>0:
-        ax_sta1 = fig.add_subplot(row1_gs[3])   # STA cluster 1
-        sta = compute_sta_chunked(
-            spikes_sec=s1/fs,
-            triggers_sec=triggers,
-            generator=generator,
-            seed=11111,
-            depth=sta_depth,
-            offset=sta_offset,
-            chunk_size=sta_chunk_size,
-            refresh=sta_refresh
-        )
-        # Time course from peak pixel
-        max_idx = np.unravel_index(np.abs(sta).argmax(), sta.shape)
-        # Display STA frame at peak time
-        peak_frame = max_idx[3]
-        if peak_frame>7 or peak_frame<3:
-            peak_frame = 4
-        rgb = sta[:, :, :, peak_frame]
-        vmax = np.max(np.abs(sta)) * 2
-        norm_rgb = rgb / vmax + 0.5
-        norm_rgb = np.clip(norm_rgb, 0, 1)
-
-        ax_sta1.imshow(norm_rgb.transpose(1, 0, 2), origin='upper')
-        ax_sta1.set_title(f"STA Frame {peak_frame + 1}", fontsize=10)
-        ax_sta1.set_aspect('equal')
-        ax_sta1.axis('off')
-        ax_sta1.set_position(ax_sta1.get_position().expanded(1.1, 1.0))
-
-
-    if len(s2) > 0 and s2[0]>0:
-        ax_sta2 = fig.add_subplot(row1_gs[4])   # STA cluster 2
-        sta = compute_sta_chunked(
-            spikes_sec=s2/fs,
-            triggers_sec=triggers,
-            generator=generator,
-            seed=11111,
-            depth=sta_depth,
-            offset=sta_offset,
-            chunk_size=sta_chunk_size,
-            refresh=sta_refresh
-        )
-        # Time course from peak pixel
-        max_idx = np.unravel_index(np.abs(sta).argmax(), sta.shape)
-        # Display STA frame at peak time
-        peak_frame = max_idx[3]
-        if peak_frame>7 or peak_frame<3:
-            peak_frame = 4
-        rgb = sta[:, :, :, peak_frame]
-        vmax = np.max(np.abs(sta)) * 2
-        norm_rgb = rgb / vmax + 0.5
-        norm_rgb = np.clip(norm_rgb, 0, 1)
-
-        ax_sta2.imshow(norm_rgb.transpose(1, 0, 2), origin='upper')
-        ax_sta2.set_title(f"STA Frame {peak_frame + 1}", fontsize=10)
-        ax_sta2.set_aspect('equal')
-        ax_sta2.axis('off')
-        ax_sta2.set_position(ax_sta2.get_position().expanded(1.1, 1.0))
-
-    # --- Row 2: EI waveforms pre ---
-
-    #ei_row_pre = gridspec.GridSpecFromSubplotSpec(1, max(len(ei_clusters_pre), 2), subplot_spec=gs[1, :])
-    ei_row_pre = fig.add_subplot(gs[1, :])  # one full-width plot
-
-
-    plot_ei_waveforms(
-        ei=cluster_eis_pre,                 # list of EIs
-        positions=ei_positions,
-        ref_channel=ref_channel,
-        scale=70.0,
-        box_height=1.5,
-        box_width=50,
-        linewidth=1,
-        alpha=0.9,
-        colors=colors_pre,                 # same colors as PCA
-        ax=ei_row_pre
-    )
-
-    ei_row_pre.set_title(f"Cluster EIs; clusters {contributing_original_ids_pre} merged; total spikes {len(mean_scores_at_spikes)}", fontsize=16)
-
-    # for i in range(len(ei_clusters_pre)):
-    #     ax = fig.add_subplot(ei_row_pre[i])
-    #     color = 'red' if i == selected_index_pre else 'black'
-    #     plot_ei_waveforms(
-    #         ei=ei_clusters_pre[i],
-    #         positions=ei_positions,
-    #         scale=70.0,
-    #         box_height=1.5,
-    #         box_width=50,
-    #         linewidth=1,
-    #         alpha=0.9,
-    #         colors=color,
-    #         ax=ax
-    #     )
-    #     ax.set_title(f"Cluster {i} | N={spike_counts_pre[i]}")
-
-
-    # --- Row 3: score histograms ---
-    def clipped_hist(ax, scores, threshold, title, bins=100):
-        scores = np.asarray(scores)
-        valid = scores[np.isfinite(scores)]
-
-        if valid.size == 0 or not np.isfinite(valid).any():
-            ax.text(0.5, 0.5, 'No valid data', transform=ax.transAxes,
-                    ha='center', va='center', fontsize=10, color='red')
-            ax.set_title(title)
-            ax.set_xticks([])
-            ax.set_yticks([])
-            return
-
-        counts, bins = np.histogram(valid, bins=bins)
-        cutoff = np.sort(counts)[-4] if len(counts) >= 4 else max(counts)
-        ax.hist(valid, bins=bins, alpha=0.6, color='gray')
-        ax.axvline(threshold, color='red', linestyle='--', label=f"Threshold = {threshold:.2f}")
-        ax.set_ylim(0, cutoff * 1.1)
-        ax.set_title(title)
-        ax.grid(True)
-
-    if mean_score is not None:
-        ax3a = fig.add_subplot(gs[2, 0])
-        clipped_hist(ax3a, mean_score, mean_thresh, "Mean Score (all)")
-
-        ax3b = fig.add_subplot(gs[2, 1])
-        clipped_hist(ax3b, mean_scores_at_spikes, mean_thresh, f"Mean Score ({len(mean_scores_at_spikes)} spikes)")
-
-        ax3c = fig.add_subplot(gs[2, 2])
-        clipped_hist(ax3c, valid_score, valid_thresh, "Valid Channels (all)", bins=np.arange(0, selected_channels_count + 2))
-
-        ax3d = fig.add_subplot(gs[2, 3])
-        clipped_hist(ax3d, valid_scores_at_spikes, valid_thresh, "Valid Channels (spikes)", bins=np.arange(0, selected_channels_count + 2))
-
-    # --- Row 4: Lags and bad spikes ---
-    row4_gs = gridspec.GridSpecFromSubplotSpec(1, 5, subplot_spec=gs[3, :])
-
-    ax4a = fig.add_subplot(row4_gs[0])       # Lags
-    lags_nonzero = lags[lags != 0]
-    if lags_nonzero.size > 0:
-        ax4a.hist(lags_nonzero, bins=np.arange(-6.5, 7.5, 1), color='purple', alpha=0.7)
-    else:
-        ax4a.text(0.5, 0.5, 'No nonzero lags', transform=ax4a.transAxes,
-                ha='center', va='center', fontsize=10, color='red')
-        ax4a.set_xticks([])
-        ax4a.set_yticks([])
-    ax4a.set_title(f"Lags (Excl. 0); total spikes {len(lags)}")
-    ax4a.set_xlabel("Lag (samples)")
-    ax4a.grid(True)
-
-
-    ax4b = fig.add_subplot(row4_gs[1:3])     # Bad spikes
-    if isinstance(bad_spike_traces, np.ndarray) and bad_spike_traces.shape[0] > 0:
-        for trace in snips_bad:
-            ax4b.plot(trace, color='green', alpha=1, linewidth=1)
-        for trace in bad_spike_traces:
-            ax4b.plot(trace, color='black', alpha=1, linewidth=1)
-    else:
-        ax4b.text(0.5, 0.5, 'No bad spikes', transform=ax4b.transAxes,
-                ha='center', va='center', fontsize=10, color='red')
-        ax4b.set_xticks([])
-        ax4b.set_yticks([])
-
-    ax4b.plot(good_mean_trace, color='red', linewidth=1.5, label='Good Mean')
-    ax4b.axhline(threshold_ampl, color='black', linestyle='--', label=f"Threshold = {threshold_ampl:.2f}")
-    ax4b.set_title(f"Ref Channel {ref_channel+1} | {len(bad_spike_traces)} bad spikes | orig threshold {-orig_threshold:.1f}")
-    ax4b.grid(True)
-
-    ax4b.legend(
-        loc='upper center',
-        bbox_to_anchor=(0.5, -0.15),  # x=center, y=below the axis
-        ncol=2,  # spread horizontally
-        fontsize=14,
-        frameon=False
-    )
-
-    ax4c = fig.add_subplot(row4_gs[3:5])     # KS matches
-    ax4c.axis('off')
-
-    if ks_matches:
-        table_data = [
-            ["KS Unit", "Vision ID", "Sim", "N spikes"]
-        ] + [
-            [m["unit_id"], m["vision_id"],f"{m['similarity']:.2f}", m["n_spikes"]] for m in ks_matches
-        ]
-
-        tb = ax4c.table(
-            cellText=table_data[1:],
-            colLabels=table_data[0],
-            loc='center',
-            cellLoc='center',
-            bbox=[0.3, 0.0, 0.7, 1.0] 
-        )
-        tb.scale(0.6, 1)
-        for i in range(len(ks_matches) + 1):
-            for j in range(4):
-                tb[(i, j)].set_fontsize(14)
-    else:
-        ax4c.text(0.5, 0.5, 'No match', transform=ax4c.transAxes,
-                       ha='center', va='center', fontsize=14, color='gray')
-    
-    ax4c.set_title("Matching KS Units")
-
-    # --- Row 5: PCA post and sim matrix ---
-    ax5 = fig.add_subplot(gs[4, 0])
-    ax5.set_title("Post-EI PCA")
-    for lbl in np.unique(labels_post):
-        pts = pcs_post[labels_post == lbl]
-        ax5.scatter(pts[:, 0], pts[:, 1], s=5, label=f"{len(pts)} sp")
-    ax5.set_xlabel("PC1")
-    ax5.set_ylabel("PC2")
-    ax5.set_aspect('equal', adjustable='box')
-    ax5.grid(True)
-    ax5.legend(
-        loc='upper center',
-        bbox_to_anchor=(0.5, -0.15),  # x=center, y=below the axis
-        ncol=len(np.unique(labels_post)),  # spread horizontally
-        fontsize=14,
-        frameon=False
-    )
-
-    ax5a = fig.add_subplot(gs[4, 1])
-    ax5a.set_title("Similarity Matrix (Post)")
-
-    label_matrix = np.empty_like(sim_matrix_post, dtype=object)
-    n = sim_matrix_post.shape[0]
-    for i in range(n):
-        for j in range(n):
-            score = sim_matrix_post[i, j]
-            n_bad = n_bad_channels_post[i, j]
-            label_matrix[i, j] = f"{score:.2f}/{n_bad}"
-
-
-    tb = Table(ax5a, bbox=[0.2, 0.2, 0.8, 0.8])
-    n = sim_matrix_post.shape[0]
-    for i in range(n):
-        for j in range(n):
-            tb.add_cell(i, j, 1/n, 1/n, text=label_matrix[i, j], loc='center')
-    for i in range(n):
-        tb.add_cell(i, -1, 1/n, 1/n, text=str(i), loc='right', edgecolor='none')
-        tb.add_cell(-1, i, 1/n, 1/n, text=str(i), loc='center', edgecolor='none')
-    ax5a.add_table(tb)
-    ax5a.axis('off')
-
-    # tb = Table(ax5a, bbox=[0.2, 0.2, 0.6, 0.6])
-    # n = sim_matrix_post.shape[0]
-    # for i in range(n):
-    #     for j in range(n):
-    #         tb.add_cell(i, j, 1/n, 1/n, text=f"{sim_matrix_post[i, j]:.2f}", loc='center')
-    # for i in range(n):
-    #     tb.add_cell(i, -1, 1/n, 1/n, text=str(i), loc='right', edgecolor='none')
-    #     tb.add_cell(-1, i, 1/n, 1/n, text=str(i), loc='center', edgecolor='none')
-    # ax5a.add_table(tb)
-    # ax5a.axis('off')
-
-
-    s0 = spikes_for_plot_post[labels_post == 0]
-    s1 = spikes_for_plot_post[labels_post == 1]
-
-    if len(s0) > 0 and s0[0]>0:
-        ax_sta50 = fig.add_subplot(gs[4, 2])   # STA cluster 0
-        sta = compute_sta_chunked(
-            spikes_sec=s0/fs,
-            triggers_sec=triggers,
-            generator=generator,
-            seed=11111,
-            depth=sta_depth,
-            offset=sta_offset,
-            chunk_size=sta_chunk_size,
-            refresh=sta_refresh
-        )
-        # Time course from peak pixel
-        max_idx = np.unravel_index(np.abs(sta).argmax(), sta.shape)
-        # Display STA frame at peak time
-        peak_frame = max_idx[3]
-        if peak_frame>7 or peak_frame<3:
-            peak_frame = 4
-        rgb = sta[:, :, :, peak_frame]
-        vmax = np.max(np.abs(sta)) * 2
-        norm_rgb = rgb / vmax + 0.5
-        norm_rgb = np.clip(norm_rgb, 0, 1)
-
-        ax_sta50.imshow(norm_rgb.transpose(1, 0, 2), origin='upper')
-        ax_sta50.set_title(f"STA Frame {peak_frame + 1}", fontsize=10)
-        ax_sta50.set_aspect('equal')
-        ax_sta50.axis('off')
-        ax_sta50.set_position(ax_sta50.get_position().expanded(1.1, 1.0))
-
-    if len(s1) > 0 and s1[0]>0:
-        ax_sta51 = fig.add_subplot(gs[4, 3])   # STA cluster 0
-        sta = compute_sta_chunked(
-            spikes_sec=s1/fs,
-            triggers_sec=triggers,
-            generator=generator,
-            seed=11111,
-            depth=sta_depth,
-            offset=sta_offset,
-            chunk_size=sta_chunk_size,
-            refresh=sta_refresh
-        )
-        # Time course from peak pixel
-        max_idx = np.unravel_index(np.abs(sta).argmax(), sta.shape)
-        # Display STA frame at peak time
-        peak_frame = max_idx[3]
-        if peak_frame>7 or peak_frame<3:
-            peak_frame = 4
-        rgb = sta[:, :, :, peak_frame]
-        vmax = np.max(np.abs(sta)) * 2
-        norm_rgb = rgb / vmax + 0.5
-        norm_rgb = np.clip(norm_rgb, 0, 1)
-
-        ax_sta51.imshow(norm_rgb.transpose(1, 0, 2), origin='upper')
-        ax_sta51.set_title(f"STA Frame {peak_frame + 1}", fontsize=10)
-        ax_sta51.set_aspect('equal')
-        ax_sta51.axis('off')
-        ax_sta51.set_position(ax_sta51.get_position().expanded(1.1, 1.0))
-
-
-
-    # --- Row 6: Final EI waveforms ---
-    #ei_row_post = gridspec.GridSpecFromSubplotSpec(1, max(len(ei_clusters_post), 2), subplot_spec=gs[5, :])
-    ei_row_post = fig.add_subplot(gs[5, :])  # one full-width plot
-    plot_ei_waveforms(
-        ei=cluster_eis_post,                 # list of EIs
-        positions=ei_positions,
-        ref_channel=ref_channel,
-        scale=70.0,
-        box_height=1.5,
-        box_width=50,
-        linewidth=1,
-        alpha=0.9,
-        colors=colors_pre,                 # same colors as PCA
-        ax=ei_row_post
-    )
-
-    ei_row_post.set_title(f"Cluster EIs; clusters {contributing_original_ids_post} merged; total spikes {len(spikes)}", fontsize=16)
-
-    # Row 7: Final unit firing, ISI, STA time course, STA frame
-    ax7a = fig.add_subplot(gs[6, 0])
-    ax7b = fig.add_subplot(gs[6, 1])
-    ax7c = fig.add_subplot(gs[6, 2])
-    ax7d = fig.add_subplot(gs[6, 3])
-
-    fs = 20000  # sampling rate in Hz
-    times_sec = np.sort(spikes) / fs # spikes in seconds
-
-    # --- Firing rate plot (smoothed) ---
-    if len(times_sec) > 0:
-        sigma_ms=2500.0
-        dt_ms=1000.0
-        dt = dt_ms / 1000.0
-        sigma_samples = sigma_ms / dt_ms
-        total_duration = 1800.1
-        time_vector = np.arange(0, total_duration, dt)
-        counts, _ = np.histogram(times_sec, bins=np.append(time_vector, total_duration))
-        rate = gaussian_filter1d(counts / dt, sigma=sigma_samples)
-        ax7a.plot(time_vector, rate, color='black')
-        ax7a.set_title(f"Smoothed Firing Rate, {len(spikes)} spikes")
-        ax7a.set_xlabel("Time (s)")
-        ax7a.set_ylabel("Rate (Hz)")
-    else:
-        ax7a.text(0.5, 0.5, 'No spikes', transform=ax7a.transAxes,
-                 ha='center', va='center', fontsize=10, color='red')
-        ax7a.set_xticks([])
-        ax7a.set_yticks([])
-
-
-    # --- ISI histogram ---
-
-    if len(times_sec) > 1:
-        isi = np.diff(times_sec) # differences in seconds
-        isi_max_s = 200.0 / 1000.0  # convert to seconds
-        bins = np.arange(0, isi_max_s + 0.0005, 0.0005)
-        hist, _ = np.histogram(isi, bins=bins)
-        fractions = hist / hist.sum() if hist.sum() > 0 else np.zeros_like(hist)
-        bin_centers = (bins[:-1] + bins[1:]) / 2
-        ax7b.plot(bin_centers, fractions, color='blue')
-        ax7b.set_xlim(0, isi_max_s)
-        ax7b.set_ylim(0, np.max(fractions) * 1.1)
-        ax7b.set_title("ISI Histogram", fontsize=10)
-        ax7b.set_xlabel("ISI (ms)")
-    else:
-        ax7b.text(0.5, 0.5, 'No ISIs', transform=ax7b.transAxes,
-            ha='center', va='center', fontsize=10, color='red')
-        ax7b.set_xticks([])
-        ax7b.set_yticks([])
-
-
-    if len(times_sec) > 0 and times_sec[0]>0:
-        sta = compute_sta_chunked(
-            spikes_sec=times_sec,
-            triggers_sec=triggers,
-            generator=generator,
-            seed=11111,
-            depth=sta_depth,
-            offset=sta_offset,
-            chunk_size=sta_chunk_size,
-            refresh=sta_refresh
-        )
-        # Time course from peak pixel
-        max_idx = np.unravel_index(np.abs(sta).argmax(), sta.shape)
-        y, x = max_idx[0], max_idx[1]
-        red_tc = sta[y, x, 0, :][::-1]
-        green_tc = sta[y, x, 1, :][::-1]
-        blue_tc = sta[y, x, 2, :][::-1]
-
-        ax7c.plot(red_tc, color='red', label='R')
-        ax7c.plot(green_tc, color='green', label='G')
-        ax7c.plot(blue_tc, color='blue', label='B')
-        ax7c.set_title("STA Time Course", fontsize=10)
-        ax7c.set_xlim(0, sta_depth - 1)
-        ax7c.set_xticks([0, sta_depth - 1])
-        ax7c.set_xlabel("Time (frames)")
-
-        # Display STA frame at peak time
-        peak_frame = max_idx[3]
-        if peak_frame>7 or peak_frame<3:
-            peak_frame = 4
-        rgb = sta[:, :, :, peak_frame]
-        vmax = np.max(np.abs(sta)) * 2
-        norm_rgb = rgb / vmax + 0.5
-        norm_rgb = np.clip(norm_rgb, 0, 1)
-
-        ax7d.imshow(norm_rgb.transpose(1, 0, 2), origin='upper')
-        ax7d.set_title(f"STA Frame {peak_frame + 1}", fontsize=10)
-        ax7d.set_aspect('equal')
-        ax7d.axis('off')
-    
-
-    plt.subplots_adjust(top=0.97, bottom=0.03, left=0.05, right=0.98, hspace=0.5, wspace=0.25)
-    os.makedirs(output_path, exist_ok=True)
-    fig.savefig(os.path.join(output_path, f"unit_{unit_id:03d}_diagnostics_ram.png"), dpi=150)
-    # plt.close(fig)
-
-
-
-
-
 def plot_unit_diagnostics_single_cluster(
     output_path: str,
     unit_id: int,
@@ -3008,41 +3313,42 @@ def plot_unit_diagnostics_single_cluster(
     # --- Row 4: Bad spikes ---
     row4_gs = gridspec.GridSpecFromSubplotSpec(1, 5, subplot_spec=gs[3, :])
 
-    ax4a = fig.add_subplot(row4_gs[0])       # Lags
+    if pcs is not None:
+        ax4a = fig.add_subplot(row4_gs[0])       # Lags
 
-    ax4a.scatter(pcs[:, 0], pcs[:, 1], s=2, alpha=0.5)
-    ax4a.scatter(pcs[outlier_inds_easy, 0], pcs[outlier_inds_easy, 1], color='green', s=6, alpha=1)
-    ax4a.scatter(pcs[outlier_inds, 0], pcs[outlier_inds, 1], color='red', s=6, alpha=1)
-    ax4a.set_title("PCA on Ref Channel Waveforms")
-    ax4a.set_xlabel("PC1")
-    ax4a.set_ylabel("PC2")
-    ax4a.grid(True)
+        ax4a.scatter(pcs[:, 0], pcs[:, 1], s=2, alpha=0.5)
+        ax4a.scatter(pcs[outlier_inds_easy, 0], pcs[outlier_inds_easy, 1], color='green', s=6, alpha=1)
+        ax4a.scatter(pcs[outlier_inds, 0], pcs[outlier_inds, 1], color='red', s=6, alpha=1)
+        ax4a.set_title("PCA on Ref Channel Waveforms")
+        ax4a.set_xlabel("PC1")
+        ax4a.set_ylabel("PC2")
+        ax4a.grid(True)
 
 
-    ax4b = fig.add_subplot(row4_gs[1:3])     # Bad spikes
-    if isinstance(bad_spike_traces_easy, np.ndarray) and bad_spike_traces_easy.shape[0] > 0:
-        for trace in bad_spike_traces_easy:
-            ax4b.plot(trace, color='green', alpha=1, linewidth=1)
-        if isinstance(bad_spike_traces, np.ndarray) and bad_spike_traces.shape[0] > 0:
-            for trace in bad_spike_traces:
-                ax4b.plot(trace, color='black', alpha=1, linewidth=1)
-    else:
-        ax4b.text(0.5, 0.5, 'No bad spikes', transform=ax4b.transAxes,
-                ha='center', va='center', fontsize=10, color='red')
-        ax4b.set_xticks([])
-        ax4b.set_yticks([])
+        ax4b = fig.add_subplot(row4_gs[1:3])     # Bad spikes
+        if isinstance(bad_spike_traces_easy, np.ndarray) and bad_spike_traces_easy.shape[0] > 0:
+            for trace in bad_spike_traces_easy:
+                ax4b.plot(trace, color='green', alpha=1, linewidth=1)
+            if isinstance(bad_spike_traces, np.ndarray) and bad_spike_traces.shape[0] > 0:
+                for trace in bad_spike_traces:
+                    ax4b.plot(trace, color='black', alpha=1, linewidth=1)
+        else:
+            ax4b.text(0.5, 0.5, 'No bad spikes', transform=ax4b.transAxes,
+                    ha='center', va='center', fontsize=10, color='red')
+            ax4b.set_xticks([])
+            ax4b.set_yticks([])
 
-    ax4b.plot(good_mean_trace, color='red', linewidth=2, label='Good Mean')
-    ax4b.set_title(f"Ref Channel {ref_channel+1} | {len(bad_spike_traces)} bad spikes | orig threshold {-orig_threshold:.1f}")
-    ax4b.grid(True)
+        ax4b.plot(good_mean_trace, color='red', linewidth=2, label='Good Mean')
+        ax4b.set_title(f"Ref Channel {ref_channel+1} | {len(bad_spike_traces)} bad spikes | orig threshold {-orig_threshold:.1f}")
+        ax4b.grid(True)
 
-    ax4b.legend(
-        loc='upper center',
-        bbox_to_anchor=(0.5, -0.15),  # x=center, y=below the axis
-        ncol=2,  # spread horizontally
-        fontsize=14,
-        frameon=False
-    )
+        ax4b.legend(
+            loc='upper center',
+            bbox_to_anchor=(0.5, -0.15),  # x=center, y=below the axis
+            ncol=2,  # spread horizontally
+            fontsize=14,
+            frameon=False
+        )
 
     ax4c = fig.add_subplot(row4_gs[3:5])     # KS matches
     ax4c.axis('off')
