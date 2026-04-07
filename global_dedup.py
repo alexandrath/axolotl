@@ -212,12 +212,64 @@ def dedup_merge_globals(
                 })
 
         if not pairs:
-            if verbose:
-                print("[global-dedup] no candidate duplicates under current thresholds.")
-            break
+            # --- SUBSET-ONLY FALLBACK: merge by spike-time inclusion even if EI metrics fail ---
+            subset_frac_thr   = float(params.get("subset_overlap_frac", 0.95))  # fraction of SMALL spikes matched
+            subset_tol        = int(params.get("subset_overlap_tol", 2))        # ±samples for a match
+            unique_small_max  = int(params.get("subset_unique_small_max", 2))   # ≤2 uniques ⇒ discard as subset
 
-        # sort by strength (highest cos_full first)
-        pairs.sort(key=lambda d: d["cos_full"], reverse=True)
+            for i in range(K):
+                Xi = infos[i]
+                # Only check templates whose peak channel is in Xi's neighborhood (same shortlist logic)
+                cand_js = [j for j in range(i+1, K) if infos[j]["peak_ch"] in Xi["neigh"]]
+                for j in cand_js:
+                    Xj = infos[j]
+
+                    # Choose big=more spikes, small=fewer (tie goes to Xi as 'big' deterministically)
+                    big, small = (Xi, Xj) if Xi["n_spikes"] >= Xj["n_spikes"] else (Xj, Xi)
+                    if small["n_spikes"] == 0:
+                        continue
+
+                    # Align SMALL -> BIG on BIG's peak channel.
+                    # _best_cosine_on_channel returns lag to apply to 'eiY' (second arg) to match 'eiX' (first arg).
+                    _, lag_sb = _best_cosine_on_channel(big["ei"], small["ei"], big["peak_ch"], max_lag)
+
+                    # Spike-time coverage: fraction of SMALL spikes matched to BIG within ±subset_tol
+                    t_big   = np.asarray(big["rec"].get("spike_times", []),   dtype=np.int64)
+                    t_small = np.asarray(small["rec"].get("spike_times", []), dtype=np.int64)
+                    if t_big.size == 0 or t_small.size == 0:
+                        continue
+
+                    t_small_shift = t_small + int(lag_sb)  # APPLY +lag to SMALL to land in BIG's timebase
+                    order_small   = np.argsort(t_small_shift)
+                    # new_mask: True for SMALL spikes that DO NOT match any BIG spike within ±tol
+                    new_mask          = _unique_new_times(t_big, t_small_shift[order_small], tol=subset_tol)
+                    n_unique_small    = int(new_mask.sum())
+                    coverage          = 1.0 - float(new_mask.mean())
+
+                    if (coverage >= subset_frac_thr) or (n_unique_small <= unique_small_max):
+                        pairs.append({
+                            "base": big["rec"],                  # winner candidate (more spikes)
+                            "cand": small["rec"],                # loser candidate (subset)
+                            "lag_B_to_A": int(lag_sb),           # shift 'cand' by +lag to align to 'base'
+                            "cos_top": float("nan"),
+                            "p2p_r": float("nan"),
+                            "cos_full": -1.0,                    # unused for sort when subset_only=True
+                            "union_size": 0,
+                            "subset_only": True,
+                            "subset_coverage": float(coverage),
+                            "subset_n_unique_small": int(n_unique_small),
+                        })
+
+
+            if not pairs:
+                if verbose:
+                    print("[global-dedup] no candidate duplicates under thresholds or subset coverage.")
+                break
+
+
+        # sort so subset-only merges are included; otherwise by cos_full
+        pairs.sort(key=lambda d: (d.get("subset_only", False), d.get("cos_full", -1.0)), reverse=True)
+
 
         # track removals by object identity
         removed_ids = set()
@@ -274,9 +326,12 @@ def dedup_merge_globals(
             t_l = np.asarray(loser["spike_times"],  dtype=np.int64)
             if t_l.size == 0:
                 continue
-            t_l_shift = t_l + lag_wrt_winner
-            new_mask  = _unique_new_times(t_w, t_l_shift, tol=jitter_tol)
-            new_times = t_l_shift[new_mask]
+            t_l_shift = t_l + lag_wrt_winner   # subtract: time shift that reproduces EI right-shift
+            # new_mask  = _unique_new_times(t_w, t_l_shift, tol=jitter_tol)
+            # new_times = t_l_shift[new_mask]
+            order_l = np.argsort(t_l_shift)
+            keep_sorted = _unique_new_times(t_w, t_l_shift[order_l], tol=jitter_tol)
+            new_times = t_l_shift[order_l][keep_sorted]
             n_add     = int(new_times.size)
 
             # ---- audit plot (robust to missing positions) ----

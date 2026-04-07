@@ -2093,29 +2093,56 @@ def roll_zero_2d(arr, shift):
 def compute_harm_map_noamp(
     ei,                   # [C, T] template
     snips,                # [C, T, N] raw snippets for many spikes
-    p2p_thr=50.0,
+    p2p_thr=30.0,
     max_channels=80,
     min_channels=10,
-    lag_radius=3,         # ±3 samples
+    lag_radius=4,         # ±3 samples
     weight_by_p2p=True,
-    weight_beta=0.5,      # w_c ∝ (p2p)^beta
+    weight_beta=0.7,      # w_c ∝ (p2p)^beta
+    channels_override=None,
     force_include_main=True,
 ):
+
     C, T = ei.shape
     assert snips.shape[:2] == (C, T), "snips must be [C,T,N]"
     N = snips.shape[2]
 
     # 1) channel selection
-    chans, ptp = select_template_channels(ei, p2p_thr, max_channels, min_channels)
-    if force_include_main:
+    # 1) channel selection
+    if channels_override is not None:
+        # accept the provided channel list as-is (order preserved, de-duped, in-bounds)
+        ch_arr = np.array(list(channels_override), dtype=int).ravel()
+        C = ei.shape[0]
+        ch_arr = ch_arr[(ch_arr >= 0) & (ch_arr < C)]
+
+        # de-duplicate while preserving order
+        seen = set()
+        chans_list = []
+        for c in ch_arr:
+            if int(c) not in seen:
+                seen.add(int(c))
+                chans_list.append(int(c))
+        # ensure main channel present if requested
         ch_main, t_neg = main_channel_and_neg_peak(ei)
-        if ch_main not in chans:
-            # ensure main channel is present; replace last channel
-            chans = np.concatenate([chans[:-1], [ch_main]])
-            # keep unique and re-order by p2p descending
-            chans = np.array(sorted(set(chans), key=lambda c: ptp[c], reverse=True), dtype=int)
+        if force_include_main and (ch_main not in seen):
+            chans_list.append(int(ch_main))
+
+        chans = np.asarray(chans_list, dtype=int)
+        # full-array p2p (used later for weights and for 'channel_ptp' in output)
+        ptp = (ei.max(axis=1) - ei.min(axis=1)).astype(ei.dtype, copy=False)
     else:
-        ch_main, t_neg = main_channel_and_neg_peak(ei)
+        # default behavior: P2P-based selection with optional force-include
+        chans, ptp = select_template_channels(ei, p2p_thr, max_channels, min_channels)
+        if force_include_main:
+            ch_main, t_neg = main_channel_and_neg_peak(ei)
+            if ch_main not in chans:
+                # ensure main channel is present; replace last channel
+                chans = np.concatenate([chans[:-1], [ch_main]])
+                # keep unique and re-order by p2p descending
+                chans = np.array(sorted(set(chans), key=lambda c: ptp[c], reverse=True), dtype=int)
+        else:
+            ch_main, t_neg = main_channel_and_neg_peak(ei)
+
 
     ei_sel = ei[chans]                 # [nch, T]
     raw_sel = snips[chans]             # [nch, T, N]
@@ -2128,6 +2155,9 @@ def compute_harm_map_noamp(
     # 3) precompute RMS(raw) per channel/spike (no mask)
     rms_raw = np.sqrt((raw_sel ** 2).mean(axis=1))             # [nch, N]
 
+    E_raw = rms_raw ** 2                                       # [nch, N]
+    _eps = 1e-12                                               # avoid divide-by-zero
+
     # 4) p2p weights (optionally tempered)
     if weight_by_p2p:
         w = (ptp[chans] ** weight_beta).astype(np.float32)
@@ -2136,12 +2166,17 @@ def compute_harm_map_noamp(
     w /= w.sum()
 
     # 5) scan lags (vectorized over all spikes)
-    deltas = np.empty((L, nch, N), dtype=np.float32)           # store ΔRMS per lag
+    deltas = np.empty((L, nch, N), dtype=np.float32)           # ΔRMS per lag
+    ratios = np.empty((L, nch, N), dtype=np.float32)           # E_res / E_raw per lag (unitless)
+
     for i, d in enumerate(lags):
         shifted = roll_zero_2d(ei_sel, d)                      # [nch, T]
-        resid = raw_sel - shifted[:, :, None]                  # [nch, T, N]
-        rms_res = np.sqrt((resid ** 2).mean(axis=1))           # [nch, N]
-        deltas[i] = rms_res - rms_raw                          # [nch, N]
+        resid   = raw_sel - shifted[:, :, None]                # [nch, T, N]
+        E_res   = (resid ** 2).mean(axis=1)                    # [nch, N]
+        rms_res = np.sqrt(E_res)                               # [nch, N]
+        deltas[i] = rms_res - rms_raw                          # [nch, N]  (kept for backward compat)
+        ratios[i] = E_res / np.maximum(E_raw, _eps)            # [nch, N]  (unitless)
+
 
     # 6) pick best lag per spike by (weighted) mean ΔRMS across channels
     mean_deltas = (deltas * w[:, None]).sum(axis=1)            # [L, N] weighted by channels
@@ -2154,9 +2189,23 @@ def compute_harm_map_noamp(
         deltas = deltas.transpose(0, 2, 1)
     elif deltas.shape != (L, nch, N):
         raise AssertionError(f"Unexpected deltas shape: {deltas.shape}")
+    
+    # Ensure ratios is (L, nch, N) too
+    if ratios.shape == (L, N, nch):
+        ratios = ratios.transpose(0, 2, 1)
+    elif ratios.shape != (L, nch, N):
+        raise AssertionError(f"Unexpected ratios shape: {ratios.shape}")
+
 
     # Gather per-spike best lag in one shot → harm: (nch, N)
     harm = np.take_along_axis(deltas, best_i[None, None, :], axis=0).squeeze(0)
+
+    # Normalized energy ratio at chosen lag, and R²-like improvement
+    harm_ratio = np.take_along_axis(ratios, best_i[None, None, :], axis=0).squeeze(0)  # [nch, N]
+    harm_r2    = 1.0 - harm_ratio                                                       # [nch, N]
+    mean_r2_unweighted = harm_r2.mean(axis=0)                                           # [N]
+    mean_r2_weighted   = (harm_r2 * w[:, None]).sum(axis=0)                             # [N]
+
 
     # Per-spike summaries
     mean_delta_unweighted = harm.mean(axis=0)                  # [N]
@@ -2173,13 +2222,308 @@ def compute_harm_map_noamp(
         "harm_matrix": harm,                        # [nch, N]
         "mean_delta_unweighted": mean_delta_unweighted,
         "mean_delta_weighted": mean_delta_weighted,
+        "harm_matrix_r2": harm_r2,                      # [nch, N], unitless, upper-bounded by 1
+        "mean_r2_unweighted": mean_r2_unweighted,       # [N]
+        "mean_r2_weighted":   mean_r2_weighted,         # [N]
+        "selection_metric":   "delta_rms",              # documents how best_i was chosen
+
     }
     return out
 
+
+def scan_continuous_harm_regions(
+    raw_data: np.ndarray,
+    final_ei_full: np.ndarray,
+    *,
+    start_sample: int = 0,
+    stop_sample: int = None,      # exclusive
+    channels=None,
+    mean_thr: float = -2.0,
+    chan_thr: float = 10.0,
+    ref_thr: float = -5.0,
+    center_index: int = 40,
+    region_max_len: int = 20,
+    amp_ratio_min: float = None,   # NEW: e.g., 0.5 → keep if ≥ 0.5× template
+    amp_ratio_max: float = None,   # NEW: e.g., 1.5 → keep if ≤ 1.5× template
+):
+    """
+    Continuous harm-map scan on intact raw data with a fixed EI (no amplitude fit).
+
+    Scans raw samples in [start_sample, stop_sample) and finds contiguous regions
+    (max length = region_max_len) where per-sample ΔRMS gates pass. For each region,
+    returns edges (absolute raw samples), the single best sample, and the ΔRMS vector
+    across the selected channels at that best sample.
+
+    Parameters
+    ----------
+    raw_data : (C, L)
+        Continuous raw voltage (μV). NOT mutated.
+    final_ei_full : (C, T)
+        EI to test; may be off-centered. We re-center so the most negative trough on the
+        strongest (most negative) channel is at sample `center_index`.
+    start_sample : int
+        Absolute raw sample at which to begin scanning (inclusive).
+    stop_sample : int or None
+        Absolute raw sample at which to stop scanning (**exclusive**).
+        If None, scans to the maximal valid sample given the EI length and center_index.
+    channels : sequence[int] or None
+        If provided, restrict to these channels. Otherwise auto-select:
+        {ref} ∪ {ch: EI_RMS ≥ chan_thr}.
+    mean_thr, chan_thr, ref_thr : float
+        Gates per raw sample:
+          • mean ΔRMS across selected channels ≤ mean_thr
+          • any channel ΔRMS > chan_thr → reject
+          • ref-channel ΔRMS < ref_thr
+    center_index : int
+        Index within the EI that is aligned to the tested raw sample (default 40).
+    region_max_len : int
+        Split any continuous pass run into chunks of at most this many samples.
+    amp_ratio_min / amp_ratio_max : float or None
+        Optional ref-channel amplitude ratio gate. If provided, keep only regions where
+        (raw trough @ ref_channel) / (template trough @ ref_channel) ∈ [min, max].
+
+    Returns
+    -------
+    dict with:
+      - regions: list of {start, end, best_idx, mean_delta, ref_delta, amp_ratio_ref?}
+                 (absolute raw samples)
+      - harm_at_best: (n_selected_channels, n_regions)  ΔRMS at each region’s best sample
+      - selected_channels: (n_sel,) channel indices used
+      - ref_channel: int
+      - center_index: int
+    """
+    C, T = final_ei_full.shape
+    assert raw_data.shape[0] == C, "raw_data and EI must share channel count"
+
+    # 0) Re-center EI (zero-padded), ref = most negative trough channel
+    trough_vals_all = final_ei_full.min(axis=1)
+    ref_channel = int(np.argmin(trough_vals_all))
+    trough_idx  = int(np.argmin(final_ei_full[ref_channel]))
+    shift = int(center_index - trough_idx)
+    ei = roll_zero_all(final_ei_full, shift)  # [C, T], zero-padded roll
+
+    trough_vals = ei.min(axis=1)
+    ref_channel = int(np.argmin(trough_vals))
+    ref_wave    = ei[ref_channel]
+    E_T_ref     = float(np.sum(ref_wave**2))
+    ei_rms      = np.sqrt(np.mean(ei**2, axis=1))  # per-channel EI RMS
+
+    # Template trough magnitude at ref channel (for amplitude ratio)
+    tpl_ref_trough = float(np.abs(np.min(ref_wave))) + 1e-12
+
+    # 1) Valid raw-sample range for testing
+    L = raw_data.shape[1]
+    min_valid = center_index
+    max_valid = L - (T - center_index) - 1  # inclusive
+    if max_valid < min_valid:
+        return dict(regions=[], harm_at_best=np.zeros((0,0), dtype=float),
+                    selected_channels=np.zeros((0,), dtype=int),
+                    ref_channel=ref_channel, center_index=center_index)
+
+    s0 = max(int(start_sample), int(min_valid))
+    sN = (max_valid + 1) if (stop_sample is None) else min(int(stop_sample), max_valid + 1)
+    if sN <= s0:
+        return dict(regions=[], harm_at_best=np.zeros((0,0), dtype=float),
+                    selected_channels=np.zeros((0,), dtype=int),
+                    ref_channel=ref_channel, center_index=center_index)
+
+    # These are the absolute raw samples we test
+    test_samples = np.arange(s0, sN, dtype=np.int64)
+    n_tests = test_samples.size
+
+    # Slice raw once to cover all needed snippet spans implicitly
+    snippet_starts = test_samples - center_index
+    base_start = int(snippet_starts[0])
+    raw_slice = raw_data[:, base_start : base_start + n_tests + T - 1]  # [C, n_tests+T-1]
+
+    # 2) Stage 1: ref-channel ΔRMS across full test span (no snippets)
+    x_ref = raw_slice[ref_channel].astype(np.float64, copy=False)
+    x2 = x_ref * x_ref
+    csum = np.empty(x2.size + 1, dtype=np.float64); csum[0] = 0.0; np.cumsum(x2, out=csum[1:])
+    rel_starts = np.arange(0, n_tests, dtype=np.int64)
+    E_x_ref = csum[rel_starts + T] - csum[rel_starts]                # [n_tests]
+    r_ref   = np.correlate(x_ref, ref_wave, mode='valid')            # [n_tests]
+    sqrt_Ex = np.sqrt(E_x_ref / T)
+    delta_ref = np.sqrt((E_x_ref + E_T_ref - 2.0 * r_ref) / T) - sqrt_Ex
+
+    pass_ref = (delta_ref < ref_thr)
+    if not np.any(pass_ref):
+        return dict(regions=[], harm_at_best=np.zeros((0,0), dtype=float),
+                    selected_channels=np.zeros((0,), dtype=int),
+                    ref_channel=ref_channel, center_index=center_index)
+
+    def _runs_to_regions(mask: np.ndarray):
+        idx = np.flatnonzero(mask)
+        if idx.size == 0:
+            return []
+        breaks = np.flatnonzero(np.diff(idx) > 1)
+        starts_local = np.r_[idx[0], idx[breaks+1]]
+        ends_local   = np.r_[idx[breaks], idx[-1]]
+        regions = []
+        for a, b in zip(starts_local, ends_local):
+            length = int(b - a + 1)
+            if length <= region_max_len:
+                regions.append((int(a), int(b)))
+            else:
+                k = (length + region_max_len - 1) // region_max_len
+                for j in range(k):
+                    s = int(a + j * region_max_len)
+                    e = int(min(a + (j+1) * region_max_len - 1, b))
+                    regions.append((s, e))
+        return regions
+
+    proto_regions_local = _runs_to_regions(pass_ref)
+    if not proto_regions_local:
+        return dict(regions=[], harm_at_best=np.zeros((0,0), dtype=float),
+                    selected_channels=np.zeros((0,), dtype=int),
+                    ref_channel=ref_channel, center_index=center_index)
+
+    # 3) Stage 2: choose channels and prune inside proto-regions only
+    if channels is not None:
+        sel_ch = np.array(sorted(set(int(c) for c in channels) | {ref_channel}), dtype=int)
+    else:
+        sel_mask = (ei_rms >= chan_thr)
+        sel_mask[ref_channel] = True
+        sel_ch = np.flatnonzero(sel_mask).astype(int)
+
+    n_sel = sel_ch.size
+    E_T   = np.sum(ei[sel_ch]**2, axis=1)                  # [n_sel]
+
+    final_regions = []
+    harm_cols = []
+
+    for (a_loc, b_loc) in proto_regions_local:
+        loc_idx = np.arange(a_loc, b_loc+1, dtype=np.int64)     # indices into relative arrays
+        abs_idx = test_samples[loc_idx]                         # absolute raw samples
+        rel_st  = loc_idx                                       # relative starts in raw_slice
+        m = rel_st.size
+        if m == 0:
+            continue
+
+        # Compute energies/correlations locally for this proto-region only
+        local_start = int(rel_st[0])
+        local_end   = int(rel_st[-1] + T)
+        raw_local = raw_slice[sel_ch, local_start:local_end].astype(np.float64, copy=False)  # [n_sel, region_len+T-1]
+
+        # prefix sums of x^2 for E_x at each start in this region
+        cs = np.empty((n_sel, raw_local.shape[1] + 1), dtype=np.float64)
+        cs[:, 0] = 0.0
+        np.cumsum(raw_local**2, axis=1, out=cs[:, 1:])
+        rel0 = rel_st - local_start
+        E_x = cs[:, rel0 + T] - cs[:, rel0]   # [n_sel, m]
+
+        # correlations r for each selected channel at each start
+        r = np.empty((n_sel, m), dtype=np.float64)
+        for i in range(n_sel):
+            ch = sel_ch[i]
+            # small loop is fine here
+            for j, s in enumerate(rel0):
+                r[i, j] = raw_local[i, s:s+T] @ ei[ch]
+
+        sqrt_Ex   = np.sqrt(E_x / T)
+        delta     = np.sqrt((E_x + E_T[:, None] - 2.0 * r) / T) - sqrt_Ex # [n_sel, m]
+
+        ref_pos   = int(np.flatnonzero(sel_ch == ref_channel)[0])
+        keep      = (delta[ref_pos] < ref_thr)
+        keep     &= np.all(delta <= chan_thr, axis=0)
+        mean_d    = delta.mean(axis=0)
+        keep     &= (mean_d <= mean_thr)
+        if not np.any(keep):
+            continue
+
+        loc_pass  = np.flatnonzero(keep)
+        breaks    = np.flatnonzero(np.diff(loc_pass) > 1)
+        sub_st    = np.r_[loc_pass[0], loc_pass[breaks+1]]
+        sub_en    = np.r_[loc_pass[breaks], loc_pass[-1]]
+
+        for ss, ee in zip(sub_st, sub_en):
+            length = int(ee - ss + 1)
+            splits = []
+            if length <= region_max_len:
+                splits = [(int(ss), int(ee))]
+            else:
+                k = (length + region_max_len - 1) // region_max_len
+                for j in range(k):
+                    s2 = int(ss + j * region_max_len)
+                    e2 = int(min(ss + (j+1) * region_max_len - 1, ee))
+                    splits.append((s2, e2))
+
+            for s2, e2 in splits:
+                seg = slice(s2, e2+1)
+                seg_mean = mean_d[seg]
+                best_local = int(s2 + int(np.argmin(seg_mean)))
+                best_abs = int(abs_idx[best_local])
+                harm_vec = delta[:, best_local].astype(np.float32)
+                final_regions.append(dict(
+                    start=int(abs_idx[s2]),
+                    end=int(abs_idx[e2]),
+                    best_idx=best_abs,
+                    mean_delta=float(seg_mean.min()),
+                    ref_delta=float(delta[ref_pos, best_local]),
+                ))
+                harm_cols.append(harm_vec)
+
+    if not final_regions:
+        return dict(regions=[], harm_at_best=np.zeros((0,0), dtype=float),
+                    selected_channels=sel_ch, ref_channel=ref_channel, center_index=center_index)
+
+    harm_at_best = np.stack(harm_cols, axis=1)  # [n_sel, n_regions]
+
+    # --- NEW: optional amplitude-ratio filter on ref channel ---
+    if (amp_ratio_min is not None) or (amp_ratio_max is not None):
+        C_tot, L_total = raw_data.shape
+        Twin = ei.shape[1]
+
+        kept_regions = []
+        kept_cols = []
+
+        for k, r in enumerate(final_regions):
+            s = int(r["best_idx"])  # absolute sample of best alignment
+            a0 = s - int(center_index)
+            a1 = a0 + Twin
+            # bounds guard
+            if a0 < 0 or a1 > L_total:
+                continue
+
+            # ref-channel window aligned to the template
+            ref_seg = raw_data[ref_channel, a0:a1]
+            raw_ref_trough = float(np.abs(np.min(ref_seg))) + 1e-12
+            ratio = raw_ref_trough / tpl_ref_trough
+
+            # decide
+            if (amp_ratio_min is not None) and (ratio < amp_ratio_min):
+                continue
+            if (amp_ratio_max is not None) and (ratio > amp_ratio_max):
+                continue
+
+            rr = dict(r)
+            rr["amp_ratio_ref"] = ratio
+            kept_regions.append(rr)
+            kept_cols.append(k)
+
+        # apply selection to harm_at_best and regions
+        if len(kept_cols) == 0:
+            harm_at_best = np.zeros((harm_at_best.shape[0], 0), dtype=harm_at_best.dtype)
+            final_regions = []
+        else:
+            kept_cols = np.asarray(kept_cols, dtype=int)
+            harm_at_best = harm_at_best[:, kept_cols]
+            final_regions = kept_regions
+    # --- end NEW ---
+
+    return dict(
+        regions=final_regions,
+        harm_at_best=harm_at_best,
+        selected_channels=sel_ch,
+        ref_channel=ref_channel,
+        center_index=center_index,
+    )
+
+
 # ---------- quick plotting (optional) ----------
-def plot_harm_heatmap(result, sort_by_ptp=True, spike_order=None, vclip=None, title=None,
+def plot_harm_heatmap(result, field="harm_matrix", sort_by_ptp=True, spike_order=None, vclip=None, title=None,
                       vline_at=None, vline_kwargs=None):
-    H   = result["harm_matrix"]           # [nch, N]
+    H   = result[field]           # [nch, N]
     ptp = result["channel_ptp"]
 
     chan_order  = np.argsort(-ptp) if sort_by_ptp else np.arange(H.shape[0])
@@ -2190,14 +2534,32 @@ def plot_harm_heatmap(result, sort_by_ptp=True, spike_order=None, vclip=None, ti
 
     Hs = H[chan_order][:, spike_order]
 
-    if vclip is None:
-        vmax = np.percentile(np.abs(Hs), 98)
+    # Fix label and vclip range for R²
+    if field == "harm_matrix_r2":
+        if vclip is None:
+            vmax = 1.0
+        else:
+            vmax = float(vclip)
+        vmin = -1.0  # Allow some red for poor-fitting spikes
+        colorbar_label = "Explained variance (R²)  [1 = perfect fit]"
     else:
-        vmax = float(vclip)
+        if vclip is None:
+            vmax = np.percentile(np.abs(Hs), 98)
+        else:
+            vmax = float(vclip)
+        vmin = -vmax
+        colorbar_label = "ΔRMS (res − raw)  [neg = help]"
+
+
+    # if vclip is None:
+    #     vmax = np.percentile(np.abs(Hs), 98)
+    # else:
+    #     vmax = float(vclip)
 
     plt.figure(figsize=(20, 4))
-    im = plt.imshow(Hs, aspect='auto', cmap='bwr', vmin=-vmax, vmax=vmax)
-    plt.colorbar(im, label="ΔRMS (res − raw)  [neg = help]")
+    im = plt.imshow(Hs, aspect='auto', cmap='bwr', vmin=vmin, vmax=vmax)
+    plt.colorbar(im, label=colorbar_label)
+
     plt.xlabel("Spike index (ordered)")
     plt.ylabel("Channels (sorted by EI p2p)" if sort_by_ptp else "Channels")
     if title:
@@ -2223,19 +2585,55 @@ def plot_harm_heatmap(result, sort_by_ptp=True, spike_order=None, vclip=None, ti
             ax.axvline(_to_xpos(vline_at), **opts)
 
     plt.tight_layout()
+    plt.show()
 
 
 
-def plot_spike_delta_summary(result, weighted=True, bins=60, title=None):
-    d = result["mean_delta_weighted"] if weighted else result["mean_delta_unweighted"]
+
+def plot_spike_delta_summary(result, base="delta", weighted=True, bins=60, title=None, vline=None):
+    """
+    Plot histogram of mean ΔRMS or mean R² per spike.
+
+    Parameters:
+    - result:  dict containing summary arrays
+    - base:    'delta' or 'r2'
+    - weighted: True = weighted version; False = unweighted
+    - bins:    histogram bins
+    - title:   plot title
+    - vline:   optional vertical line(s); defaults based on metric
+    """
+    assert base in ("delta", "r2"), f"Invalid base: {base}"
+    field = f"mean_{base}_{'weighted' if weighted else 'unweighted'}"
+    d = result.get(field, None)
+    if d is None:
+        raise ValueError(f"Field '{field}' not found in result.")
+
     plt.figure(figsize=(6, 2))
-    plt.hist(d, bins=bins)
-    plt.axvline(-2, linestyle='--')
-    plt.xlabel("Mean ΔRMS per spike")
+    plt.hist(d, bins=bins, color='gray', edgecolor='black')
+
+    # Auto vline
+    if vline is None:
+        if base == "delta":
+            vline = [-2]
+        elif base == "r2":
+            vline = [0.0]
+    if vline is not None:
+        if not isinstance(vline, (list, tuple, np.ndarray)):
+            vline = [vline]
+        for x in vline:
+            plt.axvline(x, linestyle='--', color='red', linewidth=1)
+
+    # Axis labels
+    if base == "delta":
+        plt.xlabel(f"Mean ΔRMS per spike ({'weighted' if weighted else 'unweighted'})")
+    elif base == "r2":
+        plt.xlabel(f"Mean R² per spike ({'weighted' if weighted else 'unweighted'})")
+
     plt.ylabel("Count")
     if title:
         plt.title(title)
     plt.tight_layout()
+    plt.show()
 
 
 import numpy as np
@@ -2312,23 +2710,23 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import cm, colors as mcolors
 
-
-
-import numpy as np
-
 def compute_spike_gate(
     res,
     *,
-    thr_global=-2.0,       # global weighted mean Δ must be < this
-    thr_channel=0.0,       # Δ<0 = help, Δ>0 = harm
-    min_good_frac=0.5,     # ≥ this fraction of channels must be "help"
-    max_bad_delta=5.0,     # no single harmful channel may exceed this Δ
+    thr_global=-2.0,
+    thr_channel=0.0,
+    min_good_frac=0.5,
+    max_bad_delta=5.0,
     weighted=True,
     weight_beta=0.5,
+    # existing (optional) exceed rule args...
+    ideal=None,
+    exceed_thresh=None,
+    exceed_ignore_if_delta_below=None,   # <-- if you added the previous mod
     # NEW:
-    ideal=None,            # dict from build_ideal_delta (must contain "max_trusted")
-    exceed_thresh=None     # if not None: reject spikes where any(Δ - max_trusted > exceed_thresh)
+    force_accept_if_global_below=None    # e.g. -15.0
 ):
+
     """
     Returns:
       accept_mask        : bool [N]
@@ -2336,7 +2734,8 @@ def compute_spike_gate(
       n_good, n_bad      : ints [N]
       frac_good          : float [N]
       max_harm_delta     : float [N]  (max Δ among harmful channels; -inf if none)
-      n_exceed_max_gap   : int   [N]  (NEW) #(channels with Δ - max_trusted > exceed_thresh), 0 if rule disabled
+      n_exceed_max_gap   : int   [N]  #(channels with (Δ - max_trusted) > exceed_thresh, after ignore)
+      n_exceed_ignored   : int   [N]  #(channels ignored by exceed_ignore_if_delta_below)  # NEW
     """
     H   = res["harm_matrix"]    # [nch, N], Δ = RMS(res) - RMS(raw)
     ptp = res["channel_ptp"]    # [nch]
@@ -2361,18 +2760,31 @@ def compute_spike_gate(
     max_harm_delta = np.where(harm, H, -np.inf).max(axis=0)
     harm_cap_ok = (max_harm_delta <= max_bad_delta) | ~np.isfinite(max_harm_delta)
 
-    # NEW: exceed trusted max rule
+    # NEW: exceed trusted max rule (with optional ignore for very-helpful channels)
     if (ideal is not None) and (exceed_thresh is not None):
-        mxt = np.asarray(ideal["max_trusted"], dtype=float)     # [nch]
+        mxt = np.asarray(ideal["max_trusted"], dtype=float)   # [nch]
         if mxt.shape[0] != nch:
             raise ValueError(f"ideal['max_trusted'] has nch={mxt.shape[0]} but res has nch={nch}")
-        delta_minus_max = H - mxt[:, None]                      # [nch, N]
-        exceed_mat = delta_minus_max > float(exceed_thresh)
-        n_exceed_max_gap = exceed_mat.sum(axis=0).astype(int)   # [N]
-        exceed_ok = (n_exceed_max_gap == 0)                     # reject if any channel exceeds
+
+        delta_minus_max = H - mxt[:, None]                    # [nch, N]
+        exceed_mat = delta_minus_max > float(exceed_thresh)   # raw exceeders (per-channel)
+
+        # --- ignore channels that are already very helpful (Δ < ignore threshold) ---
+        if exceed_ignore_if_delta_below is not None:
+            helpful_big = H < float(exceed_ignore_if_delta_below)   # [nch, N]
+            ignored_mat = exceed_mat & helpful_big                  # channels we will ignore
+            exceed_mat  = exceed_mat & ~helpful_big                 # keep only non-ignored exceeders
+            n_exceed_ignored = ignored_mat.sum(axis=0).astype(int)
+        else:
+            n_exceed_ignored = np.zeros(N, dtype=int)
+
+        n_exceed_max_gap = exceed_mat.sum(axis=0).astype(int)
+        exceed_ok = (n_exceed_max_gap == 0)
     else:
         n_exceed_max_gap = np.zeros(N, dtype=int)
+        n_exceed_ignored = np.zeros(N, dtype=int)
         exceed_ok = np.ones(N, dtype=bool)
+
 
     accept = (
         (global_mean < thr_global) &
@@ -2381,6 +2793,14 @@ def compute_spike_gate(
         exceed_ok    # NEW veto
     )
 
+     # --- force-accept override: if global mean ΔRMS is very negative, accept regardless ---
+    if force_accept_if_global_below is not None:
+        forced = (global_mean < float(force_accept_if_global_below))
+        accept = accept | forced
+    else:
+        forced = np.zeros_like(global_mean, dtype=bool)
+
+
     return {
         "accept_mask": accept,
         "global_mean": global_mean,
@@ -2388,12 +2808,201 @@ def compute_spike_gate(
         "frac_good": frac_good,
         "max_harm_delta": max_harm_delta,
         "n_exceed_max_gap": n_exceed_max_gap,   # expose for plotting/debug
+        "n_exceed_ignored": n_exceed_ignored,   # NEW
+        "forced_accept_mask": forced,
     }
 
 
+def plot_harm_scatter_rms_vs_r2(result, idx_in=None, idx_out=None, title=None,
+                                 weighted=True, alpha=0.6, s=18):
+    """
+    Scatter plot: mean ΔRMS vs mean R² for each spike.
+    Accepted = blue, rejected = red.
 
+    Parameters:
+    - result:   dict containing harm_matrix, harm_matrix_r2, and weight info
+    - idx_in:   list/array of accepted spike indices
+    - idx_out:  list/array of rejected spike indices
+    - weighted: use channel-weighted means
+    - alpha:    transparency
+    - s:        marker size
+    """
+    base_x = "mean_delta_weighted" if weighted else "mean_delta_unweighted"
+    base_y = "mean_r2_weighted" if weighted else "mean_r2_unweighted"
+    x = result.get(base_x, None)
+    y = result.get(base_y, None)
+    if x is None or y is None:
+        raise ValueError(f"Missing required field(s): {base_x}, {base_y}")
+
+    if idx_in is None or idx_out is None:
+        # Default full split
+        N = len(x)
+        mask = np.zeros(N, dtype=bool)
+        acc = result.get("accept_mask")
+        if acc is not None and acc.size == N:
+            mask = acc
+        idx_in = np.where(mask)[0]
+        idx_out = np.where(~mask)[0]
+
+    plt.figure(figsize=(6, 5))
+    if len(idx_out):
+        plt.scatter(x[idx_out], y[idx_out], s=s, alpha=alpha, c='red', label='Rejected')
+    if len(idx_in):
+        plt.scatter(x[idx_in], y[idx_in], s=s, alpha=alpha, c='blue', label='Accepted')
+
+    plt.axvline(0, color='gray', lw=1, linestyle='--', alpha=0.5)
+    plt.axhline(0, color='gray', lw=1, linestyle='--', alpha=0.5)
+
+    plt.xlabel("Mean ΔRMS per spike")
+    plt.ylabel("Mean R² per spike")
+    if title:
+        plt.title(title)
+    plt.grid(True, alpha=0.2)
+    plt.legend()
+    plt.tight_layout()
+
+
+import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib import cm, colors as mcolors
+
+# ---------- 1) Score every spike vs every template ----------
+def compute_template_scores_from_harm(
+    snips_raw,               # [C,T,N] float32
+    accepted_eis,            # list of dicts with 'ei' (and ideally 'selected_channels' but not required)
+    *,
+    p2p_thr=50.0,
+    max_channels=80,
+    min_channels=10,
+    lag_radius=3,
+    weight_by_p2p=True,
+    weight_beta=0.5,         # MUST match what you want to use in the harm-map
+    use_weighted=True        # return both weighted+unweighted; this selects the default for plotting
+):
+    """
+    For each template in accepted_eis, run harm-map on the SAME snips_raw and
+    collect per-spike scores:
+        - delta_weighted / delta_unweighted
+        - r2_weighted    / r2_unweighted
+    Returns:
+        dict with 4 matrices of shape [M_templates, N_spikes]
+        plus per-template metadata used internally.
+    """
+    M = len(accepted_eis)
+    C, T, N = snips_raw.shape
+    delta_w = np.empty((M, N), dtype=np.float32)
+    delta_u = np.empty((M, N), dtype=np.float32)
+    r2_w    = np.empty((M, N), dtype=np.float32)
+    r2_u    = np.empty((M, N), dtype=np.float32)
+
+    meta = []  # stash per-template res bits we use to build R2
+
+    for i, tpl in enumerate(accepted_eis):
+        ei = tpl["ei"].astype(np.float32, copy=False)
+
+        res = compute_harm_map_noamp(
+            ei, snips_raw,
+            p2p_thr=p2p_thr, max_channels=max_channels, min_channels=min_channels,
+            lag_radius=lag_radius, weight_by_p2p=weight_by_p2p, weight_beta=weight_beta
+        )
+        # ΔRMS summaries (already provided by your harm-map)
+        delta_w[i, :] = np.asarray(res["mean_delta_weighted"],   dtype=np.float32)
+        delta_u[i, :] = np.asarray(res["mean_delta_unweighted"], dtype=np.float32)
+
+        # For R² we need per-channel ΔRMS + RMS_raw on the same channel set
+        sel  = np.asarray(res["selected_channels"], dtype=int)
+        harm = np.asarray(res["harm_matrix"], dtype=np.float32)      # [nch, N] = RMS_res - RMS_raw
+        # RMS_raw per channel/spike from snips_raw
+        raw_sel = snips_raw[sel, :, :]                                # [nch, T, N]
+        rms_raw = np.sqrt(np.mean(raw_sel**2, axis=1, dtype=np.float64)).astype(np.float32)  # [nch, N]
+
+        # R² per channel/spike
+        rms_res = rms_raw + harm
+        denom   = np.maximum(rms_raw**2, 1e-12)
+        r2_ch   = 1.0 - (rms_res**2) / denom                           # [nch, N]
+
+        # weights (same rule the harm-map used)
+        ptp_sel = np.asarray(res["channel_ptp"], dtype=np.float32)     # [nch]
+        if weight_by_p2p:
+            w = (ptp_sel ** weight_beta).astype(np.float32)
+        else:
+            w = np.ones_like(ptp_sel, dtype=np.float32)
+        s = float(w.sum()) if w.size else 1.0
+        w = w / s
+
+        # aggregate across channels
+        r2_w[i, :] = (r2_ch * w[:, None]).sum(axis=0)
+        r2_u[i, :] = r2_ch.mean(axis=0)
+
+        meta.append({"sel": sel, "w": w})
+
+    return {
+        "delta_weighted":   delta_w,
+        "delta_unweighted": delta_u,
+        "r2_weighted":      r2_w,
+        "r2_unweighted":    r2_u,
+        "weight_beta":      weight_beta,
+        "use_weighted":     use_weighted,
+        "meta":             meta
+    }
+
+# ---------- 2) Best/second-best picking ----------
+def _top2_per_spike(score_matrix, *, better="lower"):
+    """
+    Given [M,N] per-template-per-spike scores, pick best and second per spike.
+    better='lower' for ΔRMS, 'higher' for R².
+    Returns: best, second, best_idx, second_idx
+    """
+    assert better in ("lower", "higher")
+    if better == "lower":
+        order = np.argsort(score_matrix, axis=0)        # ascending
+    else:
+        order = np.argsort(-score_matrix, axis=0)       # descending
+    idx1 = order[0, :]
+    idx2 = order[1, :] if score_matrix.shape[0] >= 2 else np.full(score_matrix.shape[1], -1, int)
+    cols = np.arange(score_matrix.shape[1])
+    best   = score_matrix[idx1, cols]
+    second = score_matrix[idx2, cols] if score_matrix.shape[0] >= 2 else np.full(score_matrix.shape[1], np.nan)
+    return best, second, idx1, idx2
+
+# ---------- 3) Plots: best vs second for ΔRMS and R² ----------
+def plot_best_vs_second_from_scores(scores, *, weighted=True, s=14, alpha=0.55, title_prefix=""):
+    """
+    Uses score matrices from compute_template_scores_from_harm(..)
+    Produces two scatter plots (ΔRMS and R²): X=best, Y=second best.
+    """
+    # pick matrices
+    D = scores["delta_weighted"] if weighted else scores["delta_unweighted"]
+    R = scores["r2_weighted"]    if weighted else scores["r2_unweighted"]
+
+    # ΔRMS: lower is better
+    best_d, second_d, _, _ = _top2_per_spike(D, better="lower")
+    plt.figure(figsize=(5.5, 5))
+    plt.scatter(best_d, second_d, s=s, alpha=alpha, c='gray', edgecolor='none')
+    # diagonal
+    mn = np.nanmin([best_d.min(), second_d.min()])
+    mx = np.nanmax([best_d.max(), second_d.max()])
+    plt.plot([mn, mx], [mn, mx], ls='--', lw=1, color='k', alpha=0.4)
+    plt.xlabel("Best ΔRMS per spike (most negative)")
+    plt.ylabel("Second-best ΔRMS per spike")
+    plt.title(f"{title_prefix}Best vs Second (ΔRMS, {'weighted' if weighted else 'unweighted'})")
+    plt.grid(True, alpha=0.2)
+    plt.tight_layout()
+
+    # R²: higher is better
+    best_r2, second_r2, _, _ = _top2_per_spike(R, better="higher")
+    plt.figure(figsize=(5.5, 5))
+    plt.scatter(best_r2, second_r2, s=s, alpha=alpha, c='gray', edgecolor='none')
+    mn = np.nanmin([best_r2.min(), second_r2.min()])
+    mx = np.nanmax([best_r2.max(), second_r2.max()])
+    plt.plot([mn, mx], [mn, mx], ls='--', lw=1, color='k', alpha=0.4)
+    plt.xlabel("Best R² per spike (largest)")
+    plt.ylabel("Second-best R² per spike")
+    plt.title(f"{title_prefix}Best vs Second (R², {'weighted' if weighted else 'unweighted'})")
+    plt.grid(True, alpha=0.2)
+    plt.tight_layout()
+
+
+
 
 def plot_help_harm_scatter_swapped(
     res, thr=0.0, spike_order=None, weighted=True, weight_beta=0.5,
@@ -2447,6 +3056,7 @@ def plot_help_harm_scatter_swapped(
     plt.legend()
     plt.grid(True, alpha=0.25)
     plt.tight_layout()
+    plt.show()
 
     return {
         "order": order,
@@ -3014,4 +3624,179 @@ def format_lag_metrics(metrics, central_band=1):
     return (f"Lag: MAD={metrics['mad']:.2f}, "
             f"central±{central_band} LB={metrics['central_LB']:.2f}, "
             f"edge={100*metrics['edge_frac']:.1f}% (N={metrics['N']})")
+
+
+
+# ==== Global K-means discovery helpers =======================================
+import numpy as np
+from typing import Optional, Dict, Any, Sequence, Tuple
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+
+# Uses existing helpers defined in this module:
+# - median_ei_adaptive(snips)          [C,T,N] -> [C,T]
+# - main_channel_and_neg_peak(ei)      -> (c_best, t_best)
+
+def _flatten_snips(snips: np.ndarray) -> np.ndarray:
+    """
+    snips: [C,T,N] -> X: [N, C*T] (copy)
+    """
+    C, T, N = snips.shape
+    return snips.transpose(2, 0, 1).reshape(N, C*T).copy()
+
+def build_global_pcs(snips: np.ndarray, n_pcs: int, *, center: bool = True,
+                     random_state: Optional[int] = 42) -> Tuple[np.ndarray, PCA]:
+    """
+    Flatten [C,T,N] spikes, (optionally) column-center, then randomized PCA.
+    Returns (pcs [N, n_pcs], fitted PCA object).
+    """
+    X = _flatten_snips(snips)  # [N, C*T]
+    if center:
+        X -= X.mean(axis=0, keepdims=True)
+    n_pcs = int(min(n_pcs, X.shape[0]-1, X.shape[1]))
+    if n_pcs < 2:
+        raise ValueError(f"n_pcs too small for PCA: {n_pcs}")
+    pca = PCA(n_components=n_pcs, svd_solver='randomized', random_state=random_state)
+    pcs = pca.fit_transform(X)
+    return pcs, pca
+
+def kmeans_labels(pcs: np.ndarray, k: int, *, n_init: int = 10,
+                  random_state: Optional[int] = 42) -> Tuple[np.ndarray, KMeans]:
+    """
+    Run KMeans on pcs [N, d]. Returns (labels [N], model).
+    """
+    k = int(max(2, min(k, pcs.shape[0])))  # guard rails
+    km = KMeans(n_clusters=k, n_init=n_init, random_state=random_state)
+    labels = km.fit_predict(pcs)
+    return labels, km
+
+def _cluster_snr_from_ei(ei: np.ndarray) -> float:
+    """SNR proxy: max(p2p) / median(p2p)."""
+    p2p = (ei.max(axis=1) - ei.min(axis=1)).astype(np.float32)
+    med = float(np.median(p2p)) if p2p.size else 1e-9
+    return float(p2p.max() / max(med, 1e-9))
+
+def choose_cluster_by_amp_snr(
+    snips: np.ndarray,
+    labels: np.ndarray,
+    *,
+    channel_of_interest: int,
+    sample_idx: int = 40,
+    ampl_thr: float = -100.0,
+    min_cluster_size: int = 10,
+    time_ok: Tuple[int, int] = (20, 100)
+) -> Optional[Dict[str, Any]]:
+    """
+    Among clusters with size ≥ min_cluster_size and median amp@c*,sample ≤ ampl_thr,
+    pick argmax of score = (−median_amp@c*,sample) × SNR(EI).
+    Returns dict with:
+      cand_mask, ei_cand, cid, snr, median_amp40, c_best, t_best
+    or None if no cluster passes the gates.
+    """
+    N = snips.shape[2]
+    C, T = snips.shape[0], snips.shape[1]
+    unique, counts = np.unique(labels, return_counts=True)
+    best = None
+
+    for cid, cnt in zip(unique.tolist(), counts.tolist()):
+        if cnt < min_cluster_size:
+            continue
+        cmask = (labels == cid)
+        # median amplitude on the detection channel at the reference sample
+        vals = snips[channel_of_interest, sample_idx, cmask]
+        med_amp = float(np.median(vals)) if vals.size else np.inf
+        if med_amp > ampl_thr:
+            continue
+
+        # EI + SNR
+        ei = median_ei_adaptive(snips[:, :, cmask])
+        snr = _cluster_snr_from_ei(ei)
+
+        # derive (c_best, t_best) from EI itself; keep time in allowed band
+        c_best, t_best = main_channel_and_neg_peak(ei)
+        if (t_best < time_ok[0]) or (t_best > time_ok[1]):
+            continue
+
+        score = (-med_amp) * snr
+        candidate = dict(
+            cand_mask=cmask, ei_cand=ei, cid=int(cid),
+            snr=float(snr), median_amp40=float(med_amp),
+            c_best=int(c_best), t_best=int(t_best)
+        )
+        if (best is None) or (score > best[0]):
+            best = (score, candidate)
+
+    return best[1] if best is not None else None
+
+def kmeans_discover_global(
+    snips: np.ndarray,
+    *,
+    channel_of_interest: int,
+    cfg,
+    seeds: Sequence[int] = (42, 7, 113),
+    k_list: Optional[Sequence[int]] = None,
+    pc_list: Sequence[int] = (80, 64, 100),
+    verbose: bool = True
+) -> Optional[Dict[str, Any]]:
+    """
+    Wrapper that tries (pc_dim × seed × k) in order until a valid cluster is found.
+    Returns dict with keys:
+      'cand_mask','ei_cand','labels','pcs','cid','k','pc_dim','seed','snr','median_amp40','c_best','t_best'
+    or None if no candidate passes the gates.
+    """
+    N = snips.shape[2]
+    min_k_by_size = max(3, N // max(cfg.MIN_CLUSTER_SIZE, 1))
+    default_k = int(min(cfg.KM_K_DEFAULT, min_k_by_size))
+    k_list = list(k_list) if k_list is not None else [default_k, max(3, default_k-2), default_k+2, default_k+6]
+
+    for pc_dim in pc_list:
+        try:
+            pcs, pca = build_global_pcs(snips, n_pcs=int(pc_dim), center=True, random_state=seeds[0] if len(seeds) else 42)
+        except Exception as e:
+            if verbose:
+                print(f"[kmeans_discover] skipping PCs={pc_dim}: {e}")
+            continue
+
+        for seed in seeds:
+            for k in k_list:
+                try:
+                    labels, km = kmeans_labels(pcs, k=int(k), n_init=int(cfg.KM_N_INIT), random_state=int(seed))
+                except Exception as e:
+                    if verbose:
+                        print(f"[kmeans_discover] KMeans failed (k={k}, seed={seed}): {e}")
+                    continue
+
+                chosen = choose_cluster_by_amp_snr(
+                    snips, labels,
+                    channel_of_interest=channel_of_interest,
+                    sample_idx=int(cfg.AMP_POST_SAMPLE),
+                    ampl_thr=float(cfg.AMPL_THR),
+                    min_cluster_size=int(cfg.MIN_CLUSTER_SIZE),
+                    time_ok=(20, 100)
+                )
+                if chosen is None:
+                    continue
+
+                # success
+                out = dict(chosen)
+                out.update({
+                    "labels": labels,
+                    "pcs": pcs,
+                    "k": int(k),
+                    "pc_dim": int(pc_dim),
+                    "seed": int(seed)
+                })
+                if verbose:
+                    cid = out["cid"]; n = int(np.sum(out["cand_mask"]))
+                    print(f"[kmeans_discover] success: PCs={pc_dim}, k={k}, seed={seed}, cid={cid}, size={n}, "
+                          f"SNR={out['snr']:.1f}, med_amp40={out['median_amp40']:.1f}")
+                return out
+
+        if verbose:
+            print(f"[kmeans_discover] no valid cluster with PCs={pc_dim}; trying next PC setting.")
+
+    if verbose:
+        print("[kmeans_discover] no acceptable cluster found across all PCs/seeds/k.")
+    return None
+
 

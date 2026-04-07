@@ -167,6 +167,46 @@ def build_aux_proto(
         ei = median_ei_adaptive(snips_pool)
     return {"stage": "aux", "ei": ei, "meta": {"N": int(N)}}
 
+def _best_lag_1d_ref_to_cand(ei_ref_1d: np.ndarray, ei_cand_1d: np.ndarray, win: int) -> int:
+    # Return lag to apply to CAND so that roll(cand, lag) best matches REF (cosine)
+    a = ei_ref_1d.astype(np.float32, copy=False)
+    b = ei_cand_1d.astype(np.float32, copy=False)
+    L = min(a.size, b.size)
+    a = a[:L]; b = b[:L]
+    best_val, best_lag = -np.inf, 0
+    den = (float(np.linalg.norm(a)) * float(np.linalg.norm(b))) + 1e-12
+    for lag in range(-win, win + 1):
+        if lag == 0:
+            v = float(np.dot(a, b)) / den
+        elif lag > 0:
+            v = float(np.dot(a[lag:], b[:-lag])) / den
+        else:
+            k = -lag
+            v = float(np.dot(a[:-k], b[k:])) / den
+        if v > best_val:
+            best_val, best_lag = v, lag
+    return int(best_lag)
+
+def _subset_match_stats(timesA: np.ndarray, timesB: np.ndarray, tol: int):
+    """
+    Return (match_count, NA) where 'match_count' is # of A-times matched to some B-time within ±tol.
+    'NA' is len(A). Use to compute coverage and absolute uniques: uniques = NA - match_count.
+    """
+    A = np.sort(timesA.astype(np.int64))
+    B = np.sort(timesB.astype(np.int64))
+    i = j = 0
+    NA, NB = A.size, B.size
+    match = 0
+    while i < NA and j < NB:
+        d = int(A[i] - B[j])
+        if abs(d) <= tol:
+            match += 1; i += 1; j += 1
+        elif d < -tol:
+            i += 1
+        else:
+            j += 1
+    return match, NA
+
 
 # -----------------------------
 # Core Template Evaluation (shared steps 3–12 + 15)
@@ -232,10 +272,10 @@ def core_template_evaluation(
         res = compute_harm_map_noamp(
             ei_aligned,
             snips_pool,
-            p2p_thr=float(params.get("p2p_thr", 50.0)),
+            p2p_thr=float(params.get("p2p_thr", 30.0)),
             max_channels=int(params.get("max_channels", 80)),
             min_channels=int(params.get("min_channels", 10)),
-            lag_radius=int(params.get("lag_radius", 3)),
+            lag_radius=int(params.get("lag_radius", 4)),
             weight_by_p2p=bool(params.get("weight_by_p2p", True)),
             weight_beta=float(params.get("weight_beta", 0.7)),
         )
@@ -249,8 +289,23 @@ def core_template_evaluation(
         return result, snips_pool, spike_times_pool
 
     # ---- 3) Ideal per-channel Δ from trusted spikes ----
+    subset = None
+
+    # If caller provided a per-spike mask aligned to the CURRENT pool, honor it.
+    if "train_subset_mask" in params:
+        _m = np.asarray(params["train_subset_mask"], dtype=bool)
+        if _m.size == res["harm_matrix"].shape[1]:
+            subset = np.where(_m)[0]
+
+    # Or: map a provided list of spike times to the current pool
+    elif "train_subset_times" in params:
+        _ts = np.asarray(params["train_subset_times"])
+        if _ts.size:
+            subset = np.where(np.in1d(spike_times_pool, _ts, assume_unique=False))[0]
+
     ideal = build_ideal_delta(
         res,
+        subset=subset,
         good_thresh=float(params.get("trusted_good_thresh", -5.0)),
         top_frac=float(params.get("trusted_top_frac", 0.25)),
     )
@@ -263,13 +318,16 @@ def core_template_evaluation(
         max_bad_delta=float(params.get("max_bad_delta", 10.0)),
         weighted=True,
         weight_beta=float(params.get("weight_beta", 0.7)),
+        exceed_thresh=float(params.get("exceed_thresh", 20.0)),
+        exceed_ignore_if_delta_below=float(params.get("exceed_ignore_if_delta_below", -20.0)),
+        force_accept_if_global_below=float(params.get("force_accept_if_global_below", -10.0)),
     )
+
     # Try newer signature with ideal/exceed
     try:
         gate = compute_spike_gate(
             res,
             ideal=ideal,
-            exceed_thresh=float(params.get("exceed_thresh", 20.0)),
             **gate_kwargs,
         )
     except TypeError:
@@ -287,6 +345,26 @@ def core_template_evaluation(
     if n_acc < min_n_map.get(stage, 10):
         result["reason"] = f"too_few_spikes:{n_acc}"
         return result, snips_pool, spike_times_pool
+
+    # ---- 4b) Test overlay EI from very helpful spikes (ΔRMS < thr) ----
+    # Build an EI from accepted spikes whose weighted global ΔRMS is strongly negative.
+    # Guarded by a flag, defaults ON for now.
+    ei_drms_overlay = None
+    plot_drms = bool(params.get("plot_drms_subset_overlay", True))
+    drms_thr   = float(params.get("plot_drms_subset_thr", -10.0))  # ΔRMS threshold
+    if plot_drms:
+        gm = np.asarray(gate.get("global_mean"), dtype=float)
+        if gm.size == N:
+            good_mask = acc & (gm < drms_thr)
+            n_good = int(np.sum(good_mask))
+            if n_good > 1:
+                # median over raw snippets (same convention as your main EI rebuild)
+                snips_good = snips_pool[:, :, good_mask]
+                ei_drms_overlay = median_ei_adaptive(snips_good)
+            else:
+                ei_drms_overlay = None
+        else:
+            ei_drms_overlay = None
 
     # ---- 5) Rebuild EI on accepted spikes ----
     snips_cand = snips_pool[:, :, acc]
@@ -374,6 +452,121 @@ def core_template_evaluation(
             }
             return result, snips_pool, spike_times_pool
 
+    # ---- 6.5) SUBSET-OF-GLOBAL CHECK (before subtraction) -------------------
+    # If the accepted cluster is ≥95% a subset of an existing global unit
+    # (after EI→EI alignment and ±2-sample timing tolerance), reject as subset
+    # and subtract the *absorbing* EI instead of the proto EI.
+    subset_enabled   = bool(params.get("subset_check_enabled", True))
+    subset_frac_thr  = float(params.get("subset_overlap_frac", 0.95))   # e.g. 0.95
+    subset_tol       = int(params.get("subset_overlap_tol", 2))         # samples
+    subset_lag_win   = int(params.get("subset_lag_window", 6))          # ±samples
+    unique_small_max = int(params.get("subset_unique_small_max", 2))  # ≤2 uniques ⇒ discard
+
+
+
+
+    absorber = None
+    absorber_lag = 0
+
+    if subset_enabled:
+        # Candidate times aligned to canonical timebase (center at peak channel)
+        best_lags_all = np.asarray(res.get("best_lag_per_spike"), int)
+        if best_lags_all.size == N:
+            times_acc = (spike_times_pool[acc].astype(np.int64) + best_lags_all[acc].astype(np.int64))
+        else:
+            times_acc = spike_times_pool[acc].astype(np.int64)
+
+        tmin_peak = int(np.argmin(ei_final[peak_ch]))
+        dt_center = int(center - tmin_peak)
+        cand_times_canon = (times_acc - dt_center) if dt_center != 0 else times_acc
+        ei_canon = roll_zero_all(ei_final, dt_center) if dt_center != 0 else ei_final
+
+        best_f = 0.0
+        best_n_unq = 10**9
+
+        for G in global_templates:
+            # Skip obviously unrelated globals
+            if len(G.get("spike_times", ())) == 0:
+                continue
+            eiG = np.asarray(G["ei"])
+            pkG = int(np.argmax((eiG.max(axis=1) - eiG.min(axis=1)).astype(float)))
+            # lag to apply to *candidate* so it best matches the global on pkG
+            L = _best_lag_1d_ref_to_cand(eiG[pkG], ei_canon[pkG], subset_lag_win)
+            # compare time sets after shifting candidate by +L (same sign convention as elsewhere)
+            match, NA = _subset_match_stats(cand_times_canon + int(L),
+                                            np.asarray(G["spike_times"], dtype=np.int64),
+                                            subset_tol)
+            frac = match / max(1, NA)
+            n_unq_small = NA - match
+            if (frac > best_f) or (frac == best_f and n_unq_small < best_n_unq):
+                best_f = frac
+                best_n_unq = int(n_unq_small)
+                absorber = G
+                absorber_lag = int(L)
+
+
+        if absorber is not None and (best_f >= subset_frac_thr or best_n_unq <= unique_small_max):
+            # Recompute per-spike lags for the absorber EI (same snippets, only accepted indices peeled)
+            try:
+                res_abs = compute_harm_map_noamp(
+                    absorber["ei"],
+                    snips_pool,
+                    p2p_thr=float(params.get("p2p_thr", 30.0)),
+                    max_channels=int(params.get("max_channels", 80)),
+                    min_channels=int(params.get("min_channels", 10)),
+                    lag_radius=int(params.get("lag_radius", 4)),
+                    weight_by_p2p=bool(params.get("weight_by_p2p", True)),
+                    weight_beta=float(params.get("weight_beta", 0.7)),
+                )
+            except TypeError:
+                res_abs = compute_harm_map_noamp(absorber["ei"], snips_pool)
+
+            # ---- peel with ABSORBER EI (only accepted spikes) ----
+            acc_idx = np.where(acc)[0]
+            best_lags_abs = np.asarray(res_abs.get("best_lag_per_spike"), int)
+            for j in acc_idx:
+                lag_j = int(best_lags_abs[j]) if best_lags_abs.size == N else 0
+                shifted = np.vstack([roll_zero_1d(absorber["ei"][c], lag_j) for c in range(C)])
+                snips_pool[:, :, j] = snips_pool[:, :, j] - shifted
+
+            # same trimming as normal path, but GUARANTEE PROGRESS: always drop absorbed spikes
+            amp_sample = int(params.get("amp_post_sample", 40))
+            keep_thr   = float(params.get("amp_post_thr", -100.0))
+            amp_post   = snips_pool[channel_of_interest, amp_sample, :]
+            keep_mask  = amp_post < keep_thr
+
+            # force-drop the subset-absorbed spikes even if subtraction wasn't perfect
+            keep_mask[acc_idx] = False
+
+            new_snips = snips_pool[:, :, keep_mask]
+            new_times = spike_times_pool[keep_mask]
+
+
+            # Return as a special reject (subset), with peel performed
+            result.update({
+                "decision": "rejected_subset",
+                "reason": f"subset_of_global:{int(best_f*100)}%",
+                "accept_mask": acc,
+                "ei_final": ei_final,
+                "diag": {
+                    "snr": snr,
+                    "n_spikes": int(acc.sum()),
+                    "global_mean_delta": float(np.nanmean(gate.get("global_mean", np.array([np.nan])))),
+                    "lag": lag_metrics,
+                    "channel_selection": {
+                        "n_channels": int(res.get("harm_matrix").shape[0]) if res.get("harm_matrix") is not None else None,
+                    },
+                "subset": {
+                    "absorber_index_hint": int(next((i for i, g in enumerate(global_templates) if g is absorber), -1)),
+                    "overlap_frac": float(best_f),
+                    "lag_to_absorber": int(absorber_lag),
+                    "n_unique_small": int(best_n_unq),
+                }
+
+                },
+                "dedup_action": "discarded_new"
+            })
+            return result, new_snips, new_times
 
     # ---- 7) Accept: subtract with per-spike lags; trim by post-amp ----
 
@@ -413,16 +606,37 @@ def core_template_evaluation(
     new_times = spike_times_pool[keep_mask]
 
     # ---- 8) Dedup into global set ----
+    # First, align timestamps by per-spike lags (multi-channel harm-map basis)
+    best_lags = np.asarray(res.get("best_lag_per_spike"), int)
+    if best_lags.size == N:
+        times_acc = (spike_times_pool[acc].astype(np.int64) + best_lags[acc].astype(np.int64))
+    else:
+        times_acc = spike_times_pool[acc].astype(np.int64)
+
+    # Then, enforce a single canonical timebase:
+    # center the EI on its peak (largest-p2p) channel so the negative trough is at `center_sample`,
+    # and shift the accepted timestamps by the SAME integer dt.
+    tmin_peak = int(np.argmin(ei_final[peak_ch]))
+    dt_center = int(center - tmin_peak)  # center was defined earlier as params.get("center_sample", 40)
+
+    if dt_center != 0:
+        ei_for_dedup = roll_zero_all(ei_final, dt_center)  # zero-padded shift, not wrap
+        times_for_dedup = times_acc - dt_center
+    else:
+        ei_for_dedup = ei_final
+        times_for_dedup = times_acc
+
     candidate_record = {
-        "ei": ei_final,
-        "spike_times": spike_times_pool[acc].copy(),
+        "ei": ei_for_dedup,
+        "spike_times": times_for_dedup,
         "detect_channel": int(channel_of_interest),
         "peak_channel": int(peak_ch),
         "selected_channels": final_sel,
-        "p2p": p2p,
-        "gbm": gbm,
+        "p2p": p2p,    # p2p unchanged by a pure shift
+        "gbm": gbm,    # small change from edge zeros is okay; purely diagnostic
         "snr": snr,
     }
+
 
     action, canonical = dedup_template(candidate_record, global_templates, params)
 
@@ -470,14 +684,26 @@ def core_template_evaluation(
                 pass
             if pew is not None:
                 plt.figure(figsize=(10, 6))
-                pew.plot_ei_waveforms(canonical["ei"], params.get("ei_positions", None),
-                                      ref_channel=channel_of_interest, scale=90,
-                                      box_height=1, box_width=50, colors='black')
-                if action == "kept_new":
-                    plt.title(f"Accepted EI ({stage}) SNR {snr:.1f}")
+                pos = params.get("ei_positions", None)
+                if (ei_drms_overlay is not None):
+                    # Overlay canonical EI (black) + ΔRMS<thr EI (orange)
+                    pew.plot_ei_waveforms([canonical["ei"], ei_drms_overlay], pos,
+                                          ref_channel=channel_of_interest, scale=90,
+                                          box_height=1, box_width=50,
+                                          colors=['black', 'tab:orange'])
                 else:
-                    plt.title(f"Merged EI ({stage}) SNR {snr:.1f}")
+                    # Canonical only
+                    pew.plot_ei_waveforms(canonical["ei"], pos,
+                                          ref_channel=channel_of_interest, scale=90,
+                                          box_height=1, box_width=50, colors='black')
+
+                title_core = "Accepted EI" if action == "kept_new" else "Merged EI"
+                if ei_drms_overlay is not None:
+                    plt.title(f"{title_core} ({stage}) SNR {snr:.1f}  |  overlay: ΔRMS<{drms_thr:g}")
+                else:
+                    plt.title(f"{title_core} ({stage}) SNR {snr:.1f}")
                 plt.show()
+
         except Exception:
             pass
 
@@ -562,8 +788,8 @@ def dedup_template(
             discarded_new-> kept existing X (X won), merged Y's unique spikes into X
         canonical: the winner record (object stored in global_templates)
     """
-    import numpy as _np
 
+    import numpy as _np
     # ---- parameters (with sane defaults) ----
     top_ratio      = float(params.get("dedup_top_ratio", 0.90))      # 90% of top p2p
     lag_window     = int(params.get("dedup_lag_window", 40))         # ±samples for alignment
@@ -571,7 +797,7 @@ def dedup_template(
     p2p_corr_thr   = float(params.get("dedup_p2p_corr_thr", 0.90))   # union p2p Pearson r
     cos_full_thr   = float(params.get("dedup_cos_full_thr", 0.90))   # union EI cosine
     match_tol      = int(params.get("dedup_match_tolerance", 5))     # ±samples for spike matching
-    do_plot_merge  = bool(params.get("plot_merge_overlays", True))
+    do_plot_merge  = bool(params.get("plot_merge_overlays", False))
 
     # ---- helpers ----
     def _p2p(ei: _np.ndarray) -> _np.ndarray:
@@ -678,10 +904,13 @@ def dedup_template(
                 continue
 
         # lag by maximizing cosine on single channel within ±lag_window
-        lag = _best_lag_1d(eiY[align_ch], eiX[align_ch], lag_window)
+        lag = _best_lag_1d(eiX[align_ch], eiY[align_ch], lag_window)
 
         # top-channel cosine after alignment
-        cos_top = _cosine(_np.roll(eiY[topY], lag), eiX[topY] if topY in selX else eiX[align_ch])
+        # top-channel cosine after alignment (roll X to match Y)
+        ref_ch = topY if topY in selX else align_ch
+        cos_top = _cosine(_np.roll(eiX[ref_ch], lag), eiY[ref_ch])
+
         if cos_top < cos1_thr:
             continue
 
@@ -692,10 +921,11 @@ def dedup_template(
         if r < p2p_corr_thr:
             continue
 
-        # Cosine on concatenated EI over union channels
-        eiY_U = _np.roll(eiY[U], lag, axis=1).reshape(U.size, -1)
-        eiX_U = eiX[U].reshape(U.size, -1)
-        cos_full = _cosine(eiY_U, eiX_U)
+        # Cosine on concatenated EI over union channels (roll X to match Y)
+        eiX_U = _np.roll(eiX[U], lag, axis=1).reshape(U.size, -1)
+        eiY_U = eiY[U].reshape(U.size, -1)
+        cos_full = _cosine(eiX_U, eiY_U)
+
         if cos_full < cos_full_thr:
             continue
 
@@ -710,7 +940,7 @@ def dedup_template(
 
     # ---- duplicate found → choose winner and merge spikes ----
     idxX, X, lagXY, U, cos_top, rU, cos_full = best
-    eiX = np.asarray(X["ei"])       # winner’s EI (correct template for plotting)
+    eiX = _np.asarray(X["ei"])       # winner’s EI (correct template for plotting)
 
     n_old = int(_np.asarray(X.get("spike_times", [])).size)
     n_new = int(timesY.size)
@@ -729,11 +959,12 @@ def dedup_template(
                 pew = None
             if pew is not None:
                 _plt.figure(figsize=(10,6))
-                pew.plot_ei_waveforms([eiX, _np.roll(eiY, lagXY, axis=1)],
-                                      params.get("ei_positions", None),
-                                      ref_channel=int(Y.get("detect_channel", topY)),
-                                      scale=90, box_height=1, box_width=50,
-                                      colors=['black','red'])
+                pew.plot_ei_waveforms([_np.roll(eiX, lagXY, axis=1), eiY],
+                                    params.get("ei_positions", None),
+                                    ref_channel=int(Y.get("detect_channel", topY)),
+                                    scale=90, box_height=1, box_width=50,
+                                    colors=['black','red'])
+
                 _plt.title(f"DEDUP MERGE: cos_top={cos_top:.2f}, r_p2p={rU:.2f}, cos_full={cos_full:.2f}  "
                            f"(lag={lagXY:+d})")
                 _plt.show()
@@ -747,8 +978,9 @@ def dedup_template(
     if new_wins:
         # merge unique spikes from X into Y, then replace X in globals
         merged_times = _merge_spike_times(times_w=timesY,
-                                          times_l=_np.asarray(X.get("spike_times", []), dtype=_np.int64),
-                                          lag=-lagXY, tol=match_tol)
+                                  times_l=_np.asarray(X.get("spike_times", []), dtype=_np.int64),
+                                  lag=+lagXY, tol=match_tol)
+
         Y["spike_times"] = merged_times
         _ensure_fields(Y)
         n_added = int(merged_times.size) - int(timesY.size)
@@ -759,11 +991,24 @@ def dedup_template(
             "cos_top": float(cos_top), "r_p2p": float(rU), "cos_full": float(cos_full)
         })
         global_templates[idxX] = Y
+
+        # Rebase winner's timebase so the negative peak is at center_sample on the peak channel
+        center = int(params.get("center_sample", 40))
+        peak_ch = int(Y.get("peak_channel", topY))
+        tmin = int(_np.argmin(_np.asarray(Y["ei"])[peak_ch]))
+        dt = center - tmin
+        if dt != 0:
+            Y["spike_times"] = (Y["spike_times"].astype(_np.int64) + int(dt))
+            Y["ei_recompute_pending"] = True
+            Y["merged_from"].append({"src": "center_rebase", "delta": int(dt)})
+
         return "updated_old", Y
+
     else:
         # keep X, merge unique spikes from Y into X
         merged_times = _merge_spike_times(times_w=_np.asarray(X.get("spike_times", []), dtype=_np.int64),
-                                          times_l=timesY, lag=lagXY, tol=match_tol)
+                                        times_l=timesY, lag=-lagXY, tol=match_tol)
+
         X["spike_times"] = merged_times
         _ensure_fields(X)
         n_added = int(merged_times.size) - int(n_old)
@@ -773,7 +1018,19 @@ def dedup_template(
             "src": "candidate", "delta": int(lagXY), "n_added": int(n_added),
             "cos_top": float(cos_top), "r_p2p": float(rU), "cos_full": float(cos_full)
         })
+
+        # Rebase winner's timebase so the negative peak is at center_sample on the peak channel
+        center = int(params.get("center_sample", 40))
+        peak_ch = int(X.get("peak_channel", int(_p2p(_np.asarray(X["ei"])).argmax())))
+        tmin = int(_np.argmin(_np.asarray(X["ei"])[peak_ch]))
+        dt = center - tmin
+        if dt != 0:
+            X["spike_times"] = (X["spike_times"].astype(_np.int64) + int(dt))
+            X["ei_recompute_pending"] = True
+            X["merged_from"].append({"src": "center_rebase", "delta": int(dt)})
+
         return "discarded_new", X
+
 
 
 
@@ -1080,8 +1337,8 @@ def _compute_jitter_for_template(rec: Dict[str, Any], raw_data: np.ndarray,
 
 def _harm_score_mdw(ei: np.ndarray, snips: np.ndarray) -> Optional[np.ndarray]:
     res = compute_harm_map_noamp(
-        ei, snips, p2p_thr=50.0, max_channels=80, min_channels=10,
-        lag_radius=3, weight_by_p2p=True, weight_beta=0.7
+        ei, snips, p2p_thr=30.0, max_channels=80, min_channels=10,
+        lag_radius=4, weight_by_p2p=True, weight_beta=0.7
     )
     mdw = res.get("mean_delta_weighted") if isinstance(res, dict) else None
     if mdw is None:
@@ -1158,7 +1415,7 @@ def posthoc_collapse_shards_consolidate(
         for ci, comp in enumerate(cohorts, 1):
             cohort_ids  = [templates[i][0] for i in comp]
             cohort_recs = [templates[i][1] for i in comp]
-            print(f"[Cohort] DC {dc} | cohort {ci} | template IDs: {cohort_ids}")
+            # print(f"[Cohort] DC {dc} | cohort {ci} | template IDs: {cohort_ids}")
             snr_stopped = False
 
             if len(cohort_recs) == 1:
@@ -1203,7 +1460,7 @@ def posthoc_collapse_shards_consolidate(
             shard_mask = np.array([_is_shard_like(j) for j in jit_list], dtype=bool)
             shard_ids = [int(tid) for tid, m in zip(cohort_ids, shard_mask) if m]
             kept_ids  = [int(tid) for tid, m in zip(cohort_ids, shard_mask) if not m]
-            print(f"         shard-like: {shard_ids} | pass-jitter: {kept_ids}")
+            # print(f"         shard-like: {shard_ids} | pass-jitter: {kept_ids}")
 
             if not shard_mask.any():
                 summary["cohorts"].append({
@@ -1340,20 +1597,352 @@ def posthoc_collapse_shards_consolidate(
             })
 
             # Optional plotting of resulting composites
-            if show_plots and pew is not None and len(new_templates) > 0 and plt is not None:
-                cols = 2; rows = (len(new_templates) + cols - 1) // cols
-                fig, axes = plt.subplots(rows, cols, figsize=(12, 6*rows))
-                axes = np.atleast_1d(axes).ravel()
-                for ax, recn in zip(axes, new_templates):
-                    pew.plot_ei_waveforms(
-                        recn["ei"], ei_positions,
-                        ref_channel=int(dc), scale=90,
-                        box_height=1, box_width=50, colors='black', ax=ax
-                    )
-                    ax.set_title(f"DC {dc} cohort {ci} — new composite (n={len(recn['spike_times'])})")
-                for ax in axes[len(new_templates):]:
-                    ax.axis('off')
-                plt.tight_layout(); plt.show()
+            # if show_plots and pew is not None and len(new_templates) > 0 and plt is not None:
+            #     cols = 2; rows = (len(new_templates) + cols - 1) // cols
+            #     fig, axes = plt.subplots(rows, cols, figsize=(12, 6*rows))
+            #     axes = np.atleast_1d(axes).ravel()
+            #     for ax, recn in zip(axes, new_templates):
+            #         pew.plot_ei_waveforms(
+            #             recn["ei"], ei_positions,
+            #             ref_channel=int(dc), scale=90,
+            #             box_height=1, box_width=50, colors='black', ax=ax
+            #         )
+            #         ax.set_title(f"DC {dc} cohort {ci} — new composite (n={len(recn['spike_times'])})")
+            #     for ax in axes[len(new_templates):]:
+            #         ax.axis('off')
+            #     plt.tight_layout(); plt.show()
 
     summary["status"] = "ok"
     return summary
+
+
+
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from collision_utils import scan_continuous_harm_regions
+from axolotl_utils_ram import extract_snippets_fast_ram
+import plot_ei_waveforms as pew
+
+# -------------------------
+# Small helpers
+# -------------------------
+def _recenter_ei_to_ref_trough(ei: np.ndarray, center_index: int = 40) -> np.ndarray:
+    """Zero-pad shift so the most negative trough on the strongest (most negative) channel is at center_index."""
+    C, T = ei.shape
+    ref_ch = int(np.argmin(ei.min(axis=1)))
+    trough_idx = int(np.argmin(ei[ref_ch]))
+    shift = center_index - trough_idx
+    if shift == 0:
+        return ei.copy()
+    out = np.zeros_like(ei)
+    if shift > 0:
+        out[:, shift:] = ei[:, :T-shift]
+    else:
+        s = -shift
+        out[:, :T-s] = ei[:, s:]
+    return out
+
+def _mad(x):
+    med = np.median(x)
+    return np.median(np.abs(x - med)) / 0.6745
+
+def _find_neg_peaks(x: np.ndarray, thr: float, refractory: int) -> np.ndarray:
+    """Greedy, thresholded negative-peak picker with refractory (samples)."""
+    cand = np.flatnonzero(x < thr)
+    if cand.size == 0:
+        return cand
+    out = []
+    i = 0
+    N = x.size
+    while i < cand.size:
+        left = cand[i]
+        right_edge = left + refractory
+        j = i
+        best = cand[i]; best_val = x[best]
+        while j + 1 < cand.size and cand[j + 1] <= right_edge and cand[j + 1] < N:
+            j += 1
+            v = x[cand[j]]
+            if v < best_val:
+                best = cand[j]; best_val = v
+        out.append(best)
+        i = j + 1
+    return np.asarray(out, dtype=np.int64)
+
+def _unique_gain(validated_times: np.ndarray, known_times: np.ndarray, tol: int = 15) -> tuple[int, int]:
+    """Return (unique_count, overlap_count) where overlap means |Δt| <= tol."""
+    if validated_times.size == 0:
+        return 0, 0
+    if known_times.size == 0:
+        return int(validated_times.size), 0
+    a = np.sort(validated_times)
+    b = np.sort(known_times)
+    # For each a, is there a b within tol?
+    j = 0; overlap = 0
+    for t in a:
+        while j < b.size and b[j] < t - tol:
+            j += 1
+        if j < b.size and abs(b[j] - t) <= tol:
+            overlap += 1
+    return int(a.size - overlap), int(overlap)
+
+def _compute_ei_from_times(raw_LC: np.ndarray, times_abs: np.ndarray, T: int, center_index: int, chans=None) -> tuple[np.ndarray, np.ndarray]:
+    """Use the fast extractor; returns (EI, valid_times_used). raw_LC shape (L, C)."""
+    if times_abs.size == 0:
+        C = raw_LC.shape[1]
+        return np.zeros((C, T), dtype=np.float32), times_abs
+    if chans is None:
+        chans = np.arange(raw_LC.shape[1], dtype=int)
+    pre = -center_index
+    post = T - center_index - 1
+    snips, valid_times = extract_snippets_fast_ram(raw_data=raw_LC,
+                                                   spike_times=np.asarray(times_abs, dtype=np.int64),
+                                                   window=(pre, post),
+                                                   selected_channels=chans)
+    # snips: (C, T, N_valid)
+    if snips.shape[2] == 0:
+        C = raw_LC.shape[1]
+        return np.zeros((C, T), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+    return snips.mean(axis=2).astype(np.float32), valid_times
+
+def _plot_harm_map(harm: np.ndarray, sel_ch: np.ndarray, title: str):
+    if harm.size == 0:
+        print(f"[plot] {title}: empty")
+        return
+    vmax = np.nanpercentile(np.abs(harm), 95)
+    plt.figure(figsize=(12, 5))
+    im = plt.imshow(harm, aspect='auto', cmap='coolwarm', vmin=-vmax, vmax=vmax, interpolation='nearest')
+    plt.colorbar(im, label='ΔRMS')
+    plt.yticks(np.arange(len(sel_ch)), sel_ch)
+    plt.xlabel('Region index')
+    plt.ylabel('Channel (selected)')
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
+
+def _plot_ref_waveforms(snips_CTN: np.ndarray, ref_ch: int, center_index: int, title: str):
+    if snips_CTN.shape[-1] == 0:
+        print(f"[plot] {title}: no snippets")
+        return
+    wfs = snips_CTN[ref_ch, :, :]  # (T, N)
+    mean_wf = wfs.mean(axis=1)
+    plt.figure(figsize=(20, 12))
+    plt.plot(wfs, color='red', linewidth=0.25, alpha=0.08)
+    plt.plot(mean_wf, color='black', linewidth=2.5, alpha=0.95)
+    plt.axvline(center_index, color='k', linestyle='--', linewidth=1, alpha=0.6)
+    plt.title(title + f"  (N={wfs.shape[1]})")
+    plt.xlabel("Sample (aligned; trough at center_index)")
+    plt.ylabel("μV")
+    plt.tight_layout()
+    plt.show()
+
+# -------------------------
+# Main: compare 3 strategies on ONE channel
+# -------------------------
+def compare_search_strategies_single_channel(
+    *,
+    raw_data_LC: np.ndarray,                  # (L, C) raw, immutable
+    known_ei_full: np.ndarray,                # (C, T) EI from the already-accepted template
+    known_spike_times: np.ndarray,            # (N_known,) absolute samples for that template (accepted)
+    ei_positions: np.ndarray,                 # (C, 2) electrode layout
+    target_channel: int,
+    start_sample: int,
+    stop_sample: int,                         # exclusive
+    # Harm-scan gates:
+    mean_thr: float = -2.0,
+    chan_thr: float = 10.0,
+    ref_thr: float = -5.0,
+    center_index: int = 40,
+    region_max_len: int = 20,
+    # Detector params:
+    thr_multiplier: float = 5.0,
+    refractory: int = 15,
+    soft_mask_factor: float = 0.3,
+    max_seeds_per_strategy: int = 3000,
+    dup_tol: int = 15,
+):
+    """
+    Run naive/masked/trusted search on 'target_channel', build provisional EIs from seeds,
+    validate on intact raw with scan_continuous_harm_regions, recompute EIs from validated spikes,
+    and plot EIs, harm maps, and ref-channel waveform overlays. Prints basic stats per strategy.
+    """
+    L, C = raw_data_LC.shape
+    assert 0 <= start_sample < stop_sample <= L, "Invalid scan window"
+    assert known_ei_full.shape[0] == C, "EI channel count must match raw"
+
+    # Recenter known EI and gather basics
+    known_ei_centered = _recenter_ei_to_ref_trough(known_ei_full, center_index=center_index)
+    T = known_ei_centered.shape[1]
+    target_wave_known = known_ei_centered[target_channel]  # (T,)
+    target_ei_rms = np.sqrt(np.mean(target_wave_known**2))
+    can_influence = (target_ei_rms >= chan_thr)
+
+    # Clip known times to scan window
+    in_range_mask = (known_spike_times >= start_sample) & (known_spike_times < stop_sample)
+    known_times_win = np.asarray(known_spike_times[in_range_mask], dtype=np.int64)
+
+    # Detection segment on target channel (naive baseline stream)
+    seg = raw_data_LC[start_sample:stop_sample, target_channel].astype(np.float64, copy=False)
+
+    # Common detector threshold (same across strategies to make masking/subtract meaningful)
+    sigma = _mad(seg)
+    thr = -thr_multiplier * sigma
+
+    # Helper: build masked stream (soft down-weight around known spikes)
+    def _build_masked_stream() -> np.ndarray:
+        if not can_influence or known_times_win.size == 0:
+            return seg.copy()
+        w = np.ones_like(seg, dtype=np.float64)
+        pre = center_index
+        post = T - center_index
+        for t in known_times_win:
+            a = max(0, t - start_sample - pre)
+            b = min(seg.size, t - start_sample + post)
+            if a < b:
+                w[a:b] *= soft_mask_factor
+        return seg * w
+
+    # Helper: build trusted stream (subtract known template on this channel only)
+    def _build_trusted_stream() -> np.ndarray:
+        if not can_influence or known_times_win.size == 0:
+            return seg.copy()
+        out = seg.copy()
+        pre = center_index
+        post = T - center_index
+        for t in known_times_win:
+            a = t - start_sample - pre
+            b = a + T
+            aa = max(0, a)
+            bb = min(seg.size, b)
+            if aa < bb:
+                ta = aa - a  # template start offset if left-truncated
+                tb = ta + (bb - aa)
+                out[aa:bb] -= target_wave_known[ta:tb]
+        return out
+
+    # Strategy configs
+    streams = {
+        'naive':   seg,
+        'masked':  _build_masked_stream(),
+        'trusted': _build_trusted_stream(),
+    }
+
+    results = {}
+    for name, stream in streams.items():
+        # 1) Detect seeds on target channel
+        seeds_local = _find_neg_peaks(stream, thr=thr, refractory=refractory)  # relative to start_sample
+        seeds_abs = seeds_local + start_sample
+        # Optional cap for speed
+        if max_seeds_per_strategy is not None and seeds_abs.size > max_seeds_per_strategy:
+            # Take the most negative peaks first
+            order = np.argsort(stream[seeds_local])  # ascending (most negative first)
+            seeds_abs = seeds_abs[order[:max_seeds_per_strategy]]
+
+        # 2) Build provisional EI from seeds (intact raw)
+        chans_all = np.arange(C, dtype=int)
+        ei_seed, valid_seed_times = _compute_ei_from_times(raw_data_LC, seeds_abs, T=T, center_index=center_index, chans=chans_all)
+        ei_seed_centered = _recenter_ei_to_ref_trough(ei_seed, center_index=center_index)
+
+        # 3) Validate on raw via continuous harm-scan
+        scan = scan_continuous_harm_regions(
+            raw_data=raw_data_LC.T,                 # function tolerates either shape (it will normalize)
+            final_ei_full=ei_seed_centered,
+            start_sample=start_sample,
+            stop_sample=stop_sample,
+            channels=None,                          # auto: {ref} ∪ {EI_RMS ≥ chan_thr}
+            mean_thr=mean_thr,
+            chan_thr=chan_thr,
+            ref_thr=ref_thr,
+            center_index=center_index,
+            region_max_len=region_max_len,
+        )
+        regions = scan['regions']
+        best_indices = np.array([r['best_idx'] for r in regions], dtype=np.int64)
+        sel_ch = scan['selected_channels']; ref_ch = int(scan['ref_channel'])
+        harm = scan['harm_at_best']
+
+        # 4) Recompute EI from validated spikes (intact raw)
+        ei_val, valid_val_times = _compute_ei_from_times(raw_data_LC, best_indices, T=T, center_index=center_index, chans=chans_all)
+        ei_val_centered = _recenter_ei_to_ref_trough(ei_val, center_index=center_index)
+
+        # 5) Stats
+        unique_gain, overlap_known = _unique_gain(best_indices, known_times_win, tol=dup_tol)
+        stats = {
+            'seeds_detected': int(seeds_abs.size),
+            'seeds_used_for_EI': int(valid_seed_times.size),
+            'validated_regions': int(len(regions)),
+            'validated_spikes': int(best_indices.size),
+            'unique_spikes_gain': int(unique_gain),
+            'overlap_with_known': int(overlap_known),
+            'pass_rate_from_seeds': float(best_indices.size / max(1, valid_seed_times.size)),
+        }
+
+        # 6) Plots
+        # EI overlays: (a) vs known template, (b) seeds vs validated (both centered)
+        try:
+            fig, ax = plt.subplots(figsize=(15, 20))
+            pew.plot_ei_waveforms([known_ei_centered, ei_val_centered],
+                                positions=ei_positions, scale=70.0,
+                                box_height=1.0, box_width=50.0, colors=['black', 'red'],ax=ax)
+            ax.set_title(f"{name.upper()} – EI overlay vs KNOWN")
+            plt.tight_layout()
+            plt.show()
+
+        except Exception as e:
+            print(f"[plot_ei_waveforms] overlay vs KNOWN failed for {name}: {e}")
+
+        try:
+            fig, ax = plt.subplots(figsize=(15, 20))
+            pew.plot_ei_waveforms([ei_seed_centered, ei_val_centered],
+                                positions=ei_positions, scale=70.0,
+                                box_height=1.0, box_width=50.0, colors=['black', 'red'], ax=ax)
+            ax.set_title(f"{name.upper()} – EI overlay: SEEDS vs VALIDATED")
+            plt.tight_layout()
+            plt.show()
+
+        except Exception as e:
+            print(f"[plot_ei_waveforms] overlay SEEDS vs VALIDATED failed for {name}: {e}")
+
+        # Harm map at region best samples
+        _plot_harm_map(harm, sel_ch, title=f"{name.upper()} – Harm map at best samples")
+
+        # Ref-channel waveforms from validated spikes
+        if best_indices.size > 0:
+            pre = -center_index; post = T - center_index - 1
+            snips_val, valid_val_times2 = extract_snippets_fast_ram(raw_data=raw_data_LC,
+                                                                    spike_times=best_indices,
+                                                                    window=(pre, post),
+                                                                    selected_channels=chans_all)
+            _plot_ref_waveforms(snips_val, ref_ch=ref_ch, center_index=center_index,
+                                title=f"{name.upper()} – Ref ch {ref_ch}: ALL waveforms (validated) + mean")
+
+        # Print stats
+        print(f"\n=== Strategy: {name.upper()} ===")
+        for k, v in stats.items():
+            print(f"{k:>22}: {v}")
+        print(f"selected_channels: {sel_ch.tolist()}  |  ref_channel: {ref_ch}\n")
+
+        # Package results
+        results[name] = dict(
+            seeds_abs=seeds_abs,
+            valid_seed_times=valid_seed_times,
+            ei_seed=ei_seed_centered,
+            scan=scan,
+            regions=regions,
+            best_indices=best_indices,
+            ei_validated=ei_val_centered,
+            stats=stats,
+        )
+
+    # Summary table
+    print("\n=== Summary (single channel) ===")
+    header = f"{'strategy':>10} | {'seeds':>7} | {'used_EI':>7} | {'validated':>9} | {'unique':>7} | {'overlap':>7} | {'pass_rate':>9}"
+    print(header)
+    print('-' * len(header))
+    for name in ['naive', 'masked', 'trusted']:
+        s = results[name]['stats']
+        print(f"{name:>10} | {s['seeds_detected']:7d} | {s['seeds_used_for_EI']:7d} | "
+              f"{s['validated_spikes']:9d} | {s['unique_spikes_gain']:7d} | {s['overlap_with_known']:7d} | "
+              f"{s['pass_rate_from_seeds']:9.3f}")
+    return results

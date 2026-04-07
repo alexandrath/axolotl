@@ -513,16 +513,62 @@ def extract_snippets_fast_ram(
     m = (spike_times + pre >= 0) & (spike_times + post < total_samples)
     valid_times = spike_times[m]
     N = valid_times.size
+
+    if selected_channels is None:
+        selected_channels = np.arange(raw_data.shape[1], dtype=np.int32)
     K = len(selected_channels)
+
     if N == 0:
         return np.empty((K, win_len, 0), np.float32), valid_times
 
-    offsets = np.arange(pre, post + 1, dtype=np.int64)
-    rows_idx = (valid_times[:, None] + offsets[None, :]).reshape(-1)  # [N*L]
-    snips = raw_data[rows_idx[:, None], selected_channels]  # [N*L, K]
-    snips = snips.astype(np.float32, copy=False).reshape(N, win_len, K).transpose(2,1,0)  # [K,L,N]
+    import os
 
-    return snips, valid_times
+    offsets = np.arange(pre, post + 1, dtype=np.int64)
+
+    # Preallocate output [K, L, N]
+    K = int(len(selected_channels))
+    out = np.empty((K, win_len, N), dtype=np.float32)
+
+    # Heuristic memory budget for the per-batch temp (in MB); override via env if desired
+    budget_mb = int(os.environ.get("AX_SNIP_BATCH_MB", "256"))
+    budget_bytes = max(64, budget_mb) * (1024**2)
+
+    # Estimate bytes per sample we need to hold at once:
+    #   tmp int16 gather + float32 slice we will write into `out`
+    bytes_per_elem = raw_data.dtype.itemsize + np.dtype(np.float32).itemsize  # 2 + 4 = 6
+    # batch size B so that B*L*K*6 <= budget
+    B = max(1, int(budget_bytes // (bytes_per_elem * win_len * max(1, K))))
+    B = min(B, N)  # never exceed N
+    if B <= 0:
+        B = 1
+
+    # Fast path when channels are a contiguous 1-step range (including "all channels")
+    ch = np.asarray(selected_channels, dtype=np.int64)
+    is_contig = (ch.size > 0) and np.all(np.diff(ch) == 1)
+    if is_contig:
+        ch0 = int(ch[0]); ch1 = int(ch[-1]) + 1
+
+    for i0 in range(0, N, B):
+        i1 = min(i0 + B, N)
+        vt = valid_times[i0:i1]
+        # rows for this batch
+        rows = (vt[:, None] + offsets[None, :]).reshape(-1)               # [B*L]
+
+        # Gather rows first (axis=0) to keep the big dimension linear in memory
+        tmp_rows = np.take(raw_data, rows, axis=0)                         # [B*L, C] int16
+
+        # Select channels
+        if is_contig:
+            tmp = tmp_rows[:, ch0:ch1]                                     # [B*L, K] view
+        else:
+            tmp = np.take(tmp_rows, ch, axis=1)                            # [B*L, K] copy
+
+        # Reshape to [K, L, B] and write directly into the preallocated output
+        tmp = tmp.reshape(i1 - i0, win_len, K).transpose(2, 1, 0)          # [K, L, B]
+        out[:, :, i0:i1] = tmp.astype(np.float32, copy=False)
+
+    return out, valid_times
+
 
 
 from scipy.optimize import lsq_linear
@@ -3491,3 +3537,143 @@ def plot_unit_diagnostics_single_cluster(
     os.makedirs(output_path, exist_ok=True)
     fig.savefig(os.path.join(output_path, f"unit_{unit_id:03d}_diagnostics_ram.png"), dpi=150)
     plt.close(fig)
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+from compute_sta_from_spikes import compute_sta_chunked
+try:
+    # preferred in your repo
+    from benchmark_c_rgb_generation import RGBFrameGenerator
+except ImportError:
+    # fallback if you keep the class in compute_sta_from_spikes.py
+    from compute_sta_from_spikes import RGBFrameGenerator
+
+
+def compute_and_plot_sta(spike_times_samples, triggers_sec,
+                         STA_DEPTH=30, STA_OFFSET=0, STA_CHUNK=1000, STA_REFRESH=2,
+                         SEED=11111, W=20, H=40, label="", peak_frame=None,
+                         mode="rgb"):
+    """
+    mode: "rgb" (8-color, 3 bits), "bw" (binary black/white, 1 bit), "by" (blue-yellow, 2 bits)
+    """
+
+    def make_lut_noise(mode):
+        mode = mode.lower()
+        if mode == "rgb":
+            # 8-color LUT (3 bits → 8 entries)
+            lut = np.array([
+                [255, 255, 255],  # white
+                [255, 255,   0],  # yellow
+                [255,   0, 255],  # magenta
+                [255,   0,   0],  # red
+                [  0, 255, 255],  # cyan
+                [  0, 255,   0],  # green
+                [  0,   0, 255],  # blue
+                [  0,   0,   0],  # black
+            ], dtype=np.uint8).flatten()
+            noise_type, n_bits = 1, 3  # binary draws, 3 bits → 0..7
+        elif mode == "bw":
+            # 2-color LUT (1 bit → 2 entries), R=G=B
+            lut = np.array([
+                [255, 255, 255],  # white
+                [  0,   0,   0],  # black
+            ], dtype=np.uint8).flatten()
+            noise_type, n_bits = 0, 1  # binary BW path, 1 bit → 0..1
+        elif mode == "by":
+            # 4-color LUT (2 bits → 4 entries): white, yellow, blue, black
+            lut = np.array([
+                [255, 255, 255],  # white
+                [255, 255,   0],  # yellow (R+G)
+                [  0,   0, 255],  # blue
+                [  0,   0,   0],  # black
+            ], dtype=np.uint8).flatten()
+            noise_type, n_bits = 1, 2  # binary draws, 2 bits → 0..3
+        else:
+            raise ValueError(f"Unknown mode '{mode}'. Use 'rgb', 'bw', or 'by'.")
+        return lut, noise_type, n_bits
+
+    FS = 20_000.0  # spike sampling rate (Hz)
+    LIB_PATH = "/Volumes/Lab/Users/alexth/axolotl/sta/libdraw_rgb.so"
+
+    # --- Configure generator based on mode ---
+    lut, noise_type, n_bits = make_lut_noise(mode)
+    gen = RGBFrameGenerator(LIB_PATH)
+    gen.configure(width=W, height=H, lut=lut, noise_type=noise_type, n_bits=n_bits)
+
+    spikes_sec = np.asarray(spike_times_samples, dtype=float) / FS
+    sta = compute_sta_chunked(
+        spikes_sec=spikes_sec,
+        triggers_sec=np.asarray(triggers_sec, dtype=float),
+        generator=gen,
+        seed=SEED,
+        depth=STA_DEPTH,
+        offset=STA_OFFSET,
+        chunk_size=STA_CHUNK,
+        refresh=STA_REFRESH
+    )
+
+    # ---- Find peak pixel/lag, extract time courses ----
+    H_, W_, C_, D = sta.shape
+    if peak_frame is None:
+        y, x, _, peak_frame = np.unravel_index(np.abs(sta).argmax(), sta.shape)
+    else:
+        pf = int(peak_frame)
+        if not (0 <= pf < D):
+            raise ValueError(f"peak_frame {pf} out of range [0, {D-1}]")
+        y, x, _ = np.unravel_index(np.abs(sta[:, :, :, pf]).argmax(), (H_, W_, C_))
+        peak_frame = pf
+
+    red_tc   = sta[y, x, 0, :][::-1]
+    green_tc = sta[y, x, 1, :][::-1]
+    blue_tc  = sta[y, x, 2, :][::-1]
+
+    # ---- Dominant channel: pick the channel with largest |peak| ----
+    peaks = np.array([
+        np.max(np.abs(red_tc)),
+        np.max(np.abs(green_tc)),
+        np.max(np.abs(blue_tc)),
+    ])
+    dom_idx = int(np.argmax(peaks))
+    t_dom = [red_tc, green_tc, blue_tc][dom_idx]
+    dom_name = ["Red", "Green", "Blue"][dom_idx]
+    dom_color = ["red", "green", "blue"][dom_idx]
+
+    # ---- Time projection (inner product over lag) → (H, W, 3) ----
+    proj_rgb = np.einsum('hwcd,d->hwc', sta, t_dom[::-1])
+
+    # ---- Prepare frames to display ----
+    rgb_peak = sta[:, :, :, peak_frame]
+    vmax = np.max(np.abs(sta)) * 2.0 + 1e-12
+    rgb_peak_img = np.clip(rgb_peak / vmax + 0.5, 0, 1)
+
+    vmax_proj = np.max(np.abs(proj_rgb)) * 2.0 + 1e-12
+    rgb_proj_img = np.clip(proj_rgb / vmax_proj + 0.5, 0, 1)
+
+    # ---- Plot ----
+    fig, axes = plt.subplots(1, 3, figsize=(20, 3))
+    ax = axes[0]
+    ax.plot(red_tc,   color='red',   label='R')
+    ax.plot(green_tc, color='green', label='G')
+    ax.plot(blue_tc,  color='blue',  label='B')
+    ax.plot(t_dom,    linestyle='--', color=dom_color, linewidth=2.0,
+            label=f'Dominant ({dom_name})')
+    ax.set_title(f"{label} [{mode.upper()}]: STA temporal course @ (y={y}, x={x})")
+    ax.set_xlabel("Frames before spike (reversed)")
+    ax.set_xlim(0, D-1)
+    ax.legend()
+
+    ax = axes[1]
+    ax.imshow(rgb_peak_img.transpose(1, 0, 2), origin='upper')
+    ax.set_title(f"{label} [{mode.upper()}]: peak frame @ lag {peak_frame}")
+    ax.axis('off')
+
+    ax = axes[2]
+    ax.imshow(rgb_proj_img.transpose(1, 0, 2), origin='upper')
+    ax.set_title(f"{label} [{mode.upper()}]: time-projected STA (⟨STA, {dom_name}⟩)")
+    ax.axis('off')
+
+    plt.tight_layout()
+    plt.show()
+    return sta, red_tc, green_tc, blue_tc
